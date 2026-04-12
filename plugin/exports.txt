@@ -1,0 +1,5 @@
+# Export symbols for TROP Stata Plugin (macOS)
+# These symbols are exported from the plugin bundle
+
+_stata_call
+_pginit

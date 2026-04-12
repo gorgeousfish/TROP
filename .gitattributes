@@ -1,0 +1,4 @@
+# Mark binary files to prevent line-ending conversion
+*.plugin binary
+*.mlib binary
+*.png binary

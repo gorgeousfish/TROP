@@ -1,0 +1,69 @@
+v 3
+d TROP - Triply RObust Panel Estimator
+d Athey, Imbens, Qu & Viviano (2025)
+d Distribution-Date: 20260412
+d License: AGPL-3.0
+d
+d === ADO Files ===
+f ado/trop.ado
+f ado/trop_estat.ado
+f ado/trop_p.ado
+f ado/trop_validate.ado
+f ado/trop_handle_error.ado
+f ado/_trop_load_plugin.ado
+f ado/_trop_load_mata.ado
+f ado/_trop_set_grid.ado
+f ado/_trop_validate_params.ado
+f ado/_trop_cleanup_vars.ado
+f ado/trop_check.ado
+f ado/trop_bootstrap.ado
+f ado/trop_estat_summarize.ado
+f ado/trop_estat_weights.ado
+f ado/trop_estat_loocv.ado
+f ado/trop_estat_factors.ado
+f ado/trop_estat_bootstrap.ado
+f ado/trop_estat_sensitivity.ado
+f ado/trop_estat_vce.ado
+f ado/trop_predict_y0.ado
+f ado/trop_predict_y1.ado
+f ado/trop_predict_te.ado
+f ado/trop_predict_residuals.ado
+f ado/trop_predict_mu.ado
+f ado/trop_predict_alpha.ado
+f ado/trop_predict_beta.ado
+f ado/trop_predict_validate.ado
+d
+d === Help Files ===
+f ado/trop.sthlp
+f ado/trop_estat.sthlp
+f ado/trop_predict.sthlp
+d
+d === Mata Library (pre-compiled) ===
+f ltrop.mlib
+d
+d === Mata Source Files (fallback compilation) ===
+f load_mata_once.do
+f mata/compile_all.do
+f mata/trop_constants.mata
+f mata/trop_data_transfer.mata
+f mata/trop_backend_select.mata
+f mata/trop_rust_interface.mata
+f mata/trop_ereturn_store.mata
+f mata/trop_validation.mata
+f mata/trop_loocv_validation.mata
+f mata/trop_bootstrap_diagnostics.mata
+f mata/trop_estat_helpers.mata
+f mata/trop_lambda_grid.mata
+f mata/trop_estimator_core.mata
+f mata/trop_main.mata
+d
+d === Pre-compiled Plugins ===
+d Note: Only macOS ARM64 plugin included in this distribution.
+d Other platforms can be built from source using the Rust toolchain.
+f plugin/trop_macos_arm64.plugin
+d
+d === License ===
+f LICENSE
+d
+d === Ancillary Files (install via: net get trop) ===
+g ancillary/10_trop_stata.ipynb

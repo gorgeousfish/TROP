@@ -1,0 +1,13 @@
+v 3
+d TROP - Triply RObust Panel Estimator
+d
+d Implements the Triply Robust Panel (TROP) estimator from
+d Athey, Imbens, Qu & Viviano (2025) for estimating ATT
+d in panel data settings.
+d
+d Xuanyu Cai, City University of Macau (xuanyuCAI@outlook.com)
+d Wenli Xu, City University of Macau (wlxu@cityu.edu.mo)
+d
+d https://github.com/gorgeousfish/TROP
+d
+p trop TROP - Triply RObust Panel Estimator
