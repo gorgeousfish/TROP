@@ -88,29 +88,30 @@ trop_check
 
 ## Quick Start with Examples
 
-All examples below use the same simulated panel data (20 units × 15 periods, 5 treated units starting at period 11, true ATT = 0.5):
+All examples below use the **CPS log-wage dataset** — 50 US states × 40 years (1979–2018) of state-level log wages, where `d` flags state-years in which a minimum wage increase was in effect. This is one of the seven benchmark datasets from Athey et al. (2025).
+
+Download the dataset first:
 
 ```stata
-clear all
-set obs 300
-set seed 42
-gen id = mod(_n-1, 20) + 1
-gen t  = floor((_n-1)/20) + 1
-sort id t
-gen alpha_i = rnormal(0, 0.5) if t == 1
-bysort id (t): replace alpha_i = alpha_i[1]
-gen beta_t = rnormal(0, 0.3) if id == 1
-bysort t (id): replace beta_t = beta_t[1]
-gen epsilon = rnormal(0, 0.2)
-gen d = (id <= 5 & t >= 11)
-gen y = 2 + alpha_i + beta_t + 0.5*d + epsilon
-drop alpha_i beta_t epsilon
+net get trop                 /* downloads datasets to the current directory */
+use cps_logwage.dta, clear
 ```
+
+Or load directly from GitHub:
+
+```stata
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
+```
+
+**Dataset:** N = 50, T = 40, 2,000 observations. `y` = log state-level wage; `d` = minimum wage treatment (8 treated state-year cells, 0.4%); `id` = state identifier; `t` = year.
 
 ### Example 1: Fixed Hyperparameters (Twostep)
 
+Using the paper's recommended values for CPS log-wage (Table S.1 of Athey et al. 2025):
+
 ```stata
-trop y d, panelvar(id) timevar(t) fixedlambda(0 0.1 0.9)
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
+trop y d, panelvar(id) timevar(t) fixedlambda(0.1 0 0.9)
 ```
 
 Output:
@@ -122,22 +123,23 @@ TROP Estimation Results
 Method:            twostep
 Grid style:        default (17 grid points/cycle, coordinate descent)
 
-Panel dimensions:  N = 20, T = 15
-Observations:      300
-Treated:           25 ( 8.3%)
+Panel dimensions:  N = 50, T = 40
+Observations:      2000
+Treated:           8 ( 0.4%)
 
 Fixed hyperparameters (LOOCV skipped):
-  lambda_time =   0.0000
-  lambda_unit =   0.1000
+  lambda_time =   0.1000
+  lambda_unit =   0.0000
   lambda_nn   =   0.9000
 
 Treatment Effect (ATT):
-  tau     =     0.466474
+  tau     =     0.031406
 ```
 
 ### Example 2: LOOCV-Selected Hyperparameters
 
 ```stata
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
 trop y d, panelvar(id) timevar(t)
 ```
 
@@ -150,60 +152,64 @@ TROP Estimation Results
 Method:            twostep
 Grid style:        default (17 grid points/cycle, coordinate descent)
 
-Panel dimensions:  N = 20, T = 15
-Observations:      300
-Treated:           25 ( 8.3%)
+Panel dimensions:  N = 50, T = 40
+Observations:      2000
+Treated:           8 ( 0.4%)
 
 Selected hyperparameters (via LOOCV):
-  lambda_time =   0.0000
-  lambda_unit =   1.0000
+  lambda_time =   0.5000
+  lambda_unit =   5.0000
   lambda_nn   =   0.1000
-  Q(lambda_hat) =  11.937809
+  Q(lambda_hat) =   3.456566
 
 Treatment Effect (ATT):
-  tau     =     0.508639
+  tau     =     0.033572
 ```
+
+**Note:** LOOCV on N = 50, T = 40 typically takes 20–40 minutes. For faster evaluation use `fixedlambda()` or limit search with `max_loocv_samples(500)`.
 
 ### Example 3: Bootstrap Inference
 
 ```stata
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
 trop y d, panelvar(id) timevar(t) ///
-    fixedlambda(0 0.1 0.9) bootstrap(200) seed(42)
+    fixedlambda(0.1 0 0.9) bootstrap(200) seed(42)
 ```
 
 Output:
 
 ```
 Treatment Effect (ATT):
-  tau     =     0.466474
-  SE     =     0.060515
-  t      =       7.7084
-  p-value=       0.0000
-  95% CI = [    0.341578,     0.591371]
+  tau     =     0.031406
+  SE     =     0.015716
+  t      =       1.9984
+  p-value=       0.0858
+  95% CI = [   -0.005756,     0.068568]
 ```
 
 ### Example 4: Joint Method
 
 ```stata
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
 trop y d, panelvar(id) timevar(t) ///
-    method(joint) fixedlambda(0 0.1 0.9)
+    method(joint) fixedlambda(0.1 0 0.9)
 ```
 
 Output:
 
 ```
 Treatment Effect (ATT):
-  tau     =     0.468258
+  tau     =     0.031406
 
 Global intercept:
-  mu     =     1.187770
+  mu     =     5.154320
 ```
 
 ### Example 5: Post-Estimation Workflow
 
 ```stata
-* Estimate first
-trop y d, panelvar(id) timevar(t) fixedlambda(0 0.1 0.9)
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
+trop y d, panelvar(id) timevar(t) fixedlambda(0.1 0 0.9)
 
 * Predict counterfactual outcomes and treatment effects
 predict y0_hat, y0
@@ -215,9 +221,30 @@ estat weights
 estat factors
 ```
 
+`estat summarize` output:
+
+```
+-----------------------------------------------------------------
+Estimation sample summary
+-----------------------------------------------------------------
+  Number of observations:        2000    (balanced panel)
+  Number of units (N):             50
+  Number of periods (T):           40
+  Missing rate:                   0.0%
+
+Treatment structure:
+  Treated observations:             8    (  0.4%)
+  Control observations:          1992    ( 99.6%)
+  Treated units:                    8    ( 16.0%)
+  Treated periods:                  1    (  2.5%)
+  Pattern:                   multiple_treated_simultaneous
+-----------------------------------------------------------------
+```
+
 To also inspect LOOCV diagnostics, run without `fixedlambda()`:
 
 ```stata
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
 trop y d, panelvar(id) timevar(t)
 estat loocv
 ```
@@ -225,8 +252,10 @@ estat loocv
 ### Example 6: Standalone Bootstrap (Post-Estimation)
 
 ```stata
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
+
 * Estimate without bootstrap first (faster iteration)
-trop y d, panelvar(id) timevar(t) fixedlambda(0 0.1 0.9)
+trop y d, panelvar(id) timevar(t) fixedlambda(0.1 0 0.9)
 
 * Then add bootstrap inference separately
 trop_bootstrap, nreps(200) seed(42)
@@ -238,26 +267,61 @@ Output:
 ------------------------------------------------------------
 TROP Bootstrap Inference Results
 ------------------------------------------------------------
-ATT estimate:       0.466474
-Bootstrap SE:       0.060515
-95% CI:       [    0.323939,     0.591371]
-p-value:              0.0000
+ATT estimate:       0.031406
+Bootstrap SE:       0.015716
+95% CI:       [   -0.005756,     0.068568]
+p-value:              0.0858
 
 Bootstrap reps:        200
-Valid reps:           200
+Valid reps:            200
 ------------------------------------------------------------
 ```
 
-### Example 7: CPS Log-Wage Panel (Real Data)
+### Example 7: PWT Log-GDP Panel (111 Countries × 48 Years)
 
-The paper's datasets are available on GitHub. This example uses CPS state-level data (50 states × 40 years):
+For a large panel, use the Penn World Tables democracy dataset:
 
 ```stata
-use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/pwt_loggdp.dta", clear
 
-* Estimate TROP — note: LOOCV on N=50, T=40 may take several minutes
-trop y d, panelvar(id) timevar(t)
+* Paper's hyperparameters for PWT; add maxiter(200) for large panels
+trop y d, panelvar(id) timevar(t) fixedlambda(0.4 0.3 0.006) maxiter(200)
 ```
+
+Output:
+
+```
+------------------------------------------------------------------------------
+TROP Estimation Results
+------------------------------------------------------------------------------
+Method:            twostep
+Grid style:        default (17 grid points/cycle, coordinate descent)
+
+Panel dimensions:  N = 111, T = 48
+Observations:      5328
+Treated:           29 ( 0.5%)
+
+Fixed hyperparameters (LOOCV skipped):
+  lambda_time =   0.4000
+  lambda_unit =   0.3000
+  lambda_nn   =   0.0060
+
+Treatment Effect (ATT):
+  tau     =    -0.013552
+```
+
+**Available datasets** (download via `net get trop`):
+
+| File | Description | N | T |
+|------|-------------|---|---|
+| `cps_logwage.dta` | CPS state-level log wage (min wage treatment) | 50 | 40 |
+| `cps_urate.dta` | CPS state-level unemployment rate (min wage treatment) | 50 | 40 |
+| `pwt_loggdp.dta` | Penn World Tables log GDP (democracy transition) | 111 | 48 |
+| `germany_gdp.dta` | Abadie & Gardeazabal (2003) West Germany GDP | 17 | 44 |
+| `basque_gdp.dta` | Abadie (2003) Basque Country GDP | 18 | 43 |
+| `smoking_packs.dta` | California Prop 99 cigarette consumption | 39 | 31 |
+
+> `germany_gdp`, `basque_gdp`, and `smoking_packs` have `d = 0` throughout — they are raw outcome panels designed for semi-synthetic simulation (as in Table 1 of Athey et al. 2025). Assign a treatment indicator before running `trop`.
 
 ## Recommended Workflow
 
