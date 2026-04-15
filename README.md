@@ -71,7 +71,7 @@ The TROP framework nests existing estimators:
 ### Install the package
 
 ```stata
-net install trop, from("https://raw.githubusercontent.com/gorgeousfish/TROP/main/trop_stata") replace
+net install trop, from("https://raw.githubusercontent.com/gorgeousfish/TROP/main") replace
 ```
 
 This automatically installs:
@@ -253,7 +253,7 @@ Valid reps:           200
 The paper's datasets are available on GitHub. This example uses CPS state-level data (50 states × 40 years):
 
 ```stata
-use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/paper_data/cps_logwage.dta", clear
+use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/cps_logwage.dta", clear
 
 * Estimate TROP — note: LOOCV on N=50, T=40 may take several minutes
 trop y d, panelvar(id) timevar(t)

@@ -562,7 +562,7 @@ wlxu@cityu.edu.mo
 {pstd}
 {bf:From GitHub:}
 
-{phang2}{cmd:. net install trop, from("https://raw.githubusercontent.com/gorgeousfish/TROP/main/trop_stata") replace}{p_end}
+{phang2}{cmd:. net install trop, from("https://raw.githubusercontent.com/gorgeousfish/TROP/main") replace}{p_end}
 
 {pstd}
 {bf:Local installation:}
