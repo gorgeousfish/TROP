@@ -505,10 +505,14 @@ pub fn loocv_score_joint(
         delta_ex[[t_ex, i_ex]] = 0.0;
 
         // Fit joint model with the modified weights.
+        //
+        // When λ_nn ≥ 1e10 the low-rank step is skipped (L ≡ 0). τ is not used
+        // downstream (the LOOCV score uses the pseudo-residual at the excluded
+        // cell directly), so we pass a dummy 0.0 in its slot.
         let result = if lambda_nn >= 1e10 {
-            solve_joint_no_lowrank(y, d, &delta_ex.view()).map(|(mu, alpha, beta, tau)| {
+            solve_joint_no_lowrank(y, &delta_ex.view()).map(|(mu, alpha, beta)| {
                 let l = Array2::<f64>::zeros((n_periods, n_units));
-                (mu, alpha, beta, l, tau, 1_usize, true)
+                (mu, alpha, beta, l, 0.0_f64, 1_usize, true)
             })
         } else {
             solve_joint_with_lowrank(y, d, &delta_ex.view(), lambda_nn, max_iter, tol)

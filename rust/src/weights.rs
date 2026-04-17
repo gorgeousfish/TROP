@@ -112,11 +112,16 @@ pub fn compute_joint_weights(
         y, d, lambda_time, lambda_unit, treated_periods,
     );
 
-    // δ[s, j] = δ_time[s] · δ_unit[j]
+    // δ[s, j] = δ_time[s] · δ_unit[j] · (1 − D_{s,j})
+    //
+    // The (1 − D) masking implements the paper's Equation 2 objective, which
+    // sums the quadratic loss only over CONTROL observations. Zeroing δ at
+    // treated cells here ensures the downstream WLS never fits them, which in
+    // turn makes τ a post-hoc residual (no D column in the design matrix).
     let mut delta = Array2::<f64>::zeros((n_periods, n_units));
     for t in 0..n_periods {
         for i in 0..n_units {
-            delta[[t, i]] = delta_time[t] * delta_unit[i];
+            delta[[t, i]] = delta_time[t] * delta_unit[i] * (1.0 - d[[t, i]]);
         }
     }
 
@@ -125,13 +130,19 @@ pub fn compute_joint_weights(
 
 /// Decompose Twostep weights into separate time and unit vectors.
 ///
-/// Returns (θ, ω) where:
-///   θ_s = exp(−λ_time · |t − s|)           (Equation 3, time component)
-///   ω_j = exp(−λ_unit · dist_{−t}(j, i))   (Equation 3, unit component)
+/// Returns (θ, ω) matching the Python `diff_diff-3.1.1` local path (Eq. 3):
+///   θ_s = exp(−λ_time · |t − s|)            (no normalization)
+///   ω_j = exp(−λ_unit · dist_{−t}(j, i))    (no normalization)
 ///
-/// The target unit receives ω_i = 1.0. Units treated at the target period
-/// and units with non-finite distance receive ω_j = 0.0. When λ_unit = 0,
-/// all eligible control units receive ω_j = 1.0 (uniform weighting).
+/// The kernels are left **unnormalized** on purpose. Both `estimate_model`
+/// and the Python reference compute `w_max = max(W)` and the prox threshold
+/// `λ_nn / (2·w_max)` internally; normalizing here would implicitly rescale
+/// λ_nn and make fixed-λ fits disagree with the Python estimator.
+///
+/// Units treated at the target period receive ω_j = 0 (the paper's Eq. 3
+/// uses the (1 − W) factor through this exclusion). The target unit itself
+/// always gets ω_i = 1 so that the factor model has a well-defined column
+/// for the treated cell.
 ///
 /// # Arguments
 /// Same as [`compute_weight_matrix`].
@@ -150,17 +161,19 @@ pub fn compute_twostep_weight_vectors(
     lambda_unit: f64,
     time_dist: &ArrayView2<i64>,
 ) -> (Array1<f64>, Array1<f64>) {
-    // θ_s = exp(−λ_time · |t − s|)
+    // θ_s = exp(−λ_time · |t − s|), unnormalized.
     let time_weights: Array1<f64> = Array1::from_shape_fn(n_periods, |s| {
         let dist = time_dist[[target_period, s]] as f64;
         (-lambda_time * dist).exp()
     });
 
-    // ω_j = exp(−λ_unit · dist_{−t}(j, i))
+    // ω_j = exp(−λ_unit · dist_{−t}(j, i)), unnormalized.
+    // Units treated at the target period get ω_j = 0 (per paper Eq. 3 the
+    // (1 − W) mask discards them). Target unit always receives ω_i = 1.
     let mut unit_weights = Array1::<f64>::zeros(n_units);
 
     if lambda_unit == 0.0 {
-        // Uniform weighting: all untreated units at the target period get ω_j = 1.
+        // Uniform kernel: all units untreated at the target period get ω_j = 1.
         for j in 0..n_units {
             if d[[target_period, j]] == 0.0 && j != target_unit {
                 unit_weights[j] = 1.0;
@@ -173,11 +186,12 @@ pub fn compute_twostep_weight_vectors(
                 if dist.is_finite() {
                     unit_weights[j] = (-lambda_unit * dist).exp();
                 }
+                // Units with infinite distance stay at 0.
             }
         }
     }
 
-    // The target unit always participates with weight 1.
+    // Target unit always participates with ω_i = 1.
     unit_weights[target_unit] = 1.0;
 
     (time_weights, unit_weights)
@@ -311,7 +325,8 @@ mod tests {
 
     #[test]
     fn test_weight_matrix_zero_lambda() {
-        // λ_time = λ_unit = 0 ⟹ all weights equal exp(0) = 1 (unnormalized).
+        // λ_time = λ_unit = 0 ⟹ all kernels equal exp(0) = 1 (unnormalized).
+        // Every (t, i) cell takes the constant value 1.0 and the total = T · N.
         let y = array![[1.0, 2.0, 3.0], [2.0, 3.0, 4.0], [3.0, 4.0, 5.0]];
         let d = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
         let time_dist = array![[0i64, 1, 2], [1, 0, 1], [2, 1, 0]];
@@ -345,14 +360,14 @@ mod tests {
         let total: f64 = weights.sum();
         assert!(
             (total - 9.0).abs() < 1e-10,
-            "Weights should sum to 9, got {}",
+            "Unnormalized weights should sum to T·N = 9, got {}",
             total
         );
     }
 
     #[test]
-    fn test_joint_weights_unnormalized() {
-        // Joint weights are unnormalized; verify they do not sum to 1.
+    fn test_joint_weights_masked_at_treated() {
+        // After (1 − D) masking, δ[t, i] = 0 whenever d[t, i] = 1.
         let y = array![[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [4.0, 5.0]];
         let d = array![
             [0.0, 0.0],
@@ -363,26 +378,38 @@ mod tests {
 
         let weights = compute_joint_weights(&y.view(), &d.view(), 0.5, 0.5, 2);
 
-        let total: f64 = weights.sum();
-        assert!(total > 0.0, "Weights should be positive");
+        // Treated cells must be exactly zero.
+        assert_eq!(weights[[2, 1]], 0.0, "δ must be 0 at treated cell (2, 1)");
+        assert_eq!(weights[[3, 1]], 0.0, "δ must be 0 at treated cell (3, 1)");
+
+        // Untreated cells remain strictly positive.
+        let control_sum: f64 = (0..4).flat_map(|t| (0..2).map(move |i| (t, i)))
+            .filter(|(t, i)| d[[*t, *i]] == 0.0)
+            .map(|(t, i)| weights[[t, i]])
+            .sum();
+        assert!(control_sum > 0.0, "Control weights should be positive");
     }
 
     #[test]
     fn test_joint_weights_time_center() {
-        // λ_time = 0 ⟹ uniform time weights; all rows should have equal sums.
+        // λ_time = 0 ⟹ uniform time weights. With (1 − D) masking, only
+        // untreated rows are expected to have equal totals.
         let y = array![[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [4.0, 5.0]];
         let d = array![[0.0, 0.0], [0.0, 0.0], [0.0, 1.0], [0.0, 1.0]];
 
         let weights = compute_joint_weights(&y.view(), &d.view(), 0.0, 0.0, 2);
 
+        // Pre-period rows (t = 0, 1) have every unit untreated ⟹ identical sums.
         let row0_sum: f64 = weights.row(0).sum();
         let row1_sum: f64 = weights.row(1).sum();
+        assert!((row0_sum - row1_sum).abs() < 1e-10);
+
+        // Post-period rows (t = 2, 3) have unit 1 masked to zero; the
+        // remaining mass equals the weight of the surviving unit 0.
         let row2_sum: f64 = weights.row(2).sum();
         let row3_sum: f64 = weights.row(3).sum();
-
-        assert!((row0_sum - row1_sum).abs() < 1e-10);
-        assert!((row1_sum - row2_sum).abs() < 1e-10);
         assert!((row2_sum - row3_sum).abs() < 1e-10);
+        assert!(row2_sum < row1_sum, "Treated row total must shrink after masking");
     }
 
     // ========================================================================
@@ -391,7 +418,8 @@ mod tests {
 
     #[test]
     fn test_joint_weights_outer_product_structure() {
-        // δ[t,i] = δ_time[t] · δ_unit[i] ⟹ δ[t,i]/δ[t,j] = δ[s,i]/δ[s,j].
+        // δ[t, i] = δ_time[t] · δ_unit[i] · (1 − D[t, i]). The rank-1 outer
+        // product only holds on untreated cells; treated cells are masked to 0.
         let y = array![
             [1.0, 2.0, 3.0],
             [2.0, 3.0, 4.0],
@@ -407,14 +435,21 @@ mod tests {
 
         let delta = compute_joint_weights(&y.view(), &d.view(), 0.5, 0.5, 2);
 
-        // Verify rank-1 structure: δ[t,i]/δ[t,j] = δ[s,i]/δ[s,j]
-        // for all (t, s, i, j) where denominators are non-zero.
+        // Verify rank-1 structure on the untreated sub-grid only.
         let (n_periods, n_units) = delta.dim();
+        let is_control = |t: usize, i: usize| d[[t, i]] == 0.0;
 
         for t in 0..n_periods {
             for s in 0..n_periods {
                 for i in 0..n_units {
                     for j in 0..n_units {
+                        // Require all four cells to be untreated so the mask
+                        // does not break the outer-product identity.
+                        if !(is_control(t, i) && is_control(t, j)
+                            && is_control(s, i) && is_control(s, j))
+                        {
+                            continue;
+                        }
                         if delta[[t, j]] > 1e-10 && delta[[s, j]] > 1e-10 {
                             let ratio_t = delta[[t, i]] / delta[[t, j]];
                             let ratio_s = delta[[s, i]] / delta[[s, j]];
@@ -663,7 +698,9 @@ mod tests {
             *weight = (-lambda_time * dist).exp();
         }
 
-        // With λ_unit = 0, ω_j = 1 for all j, so row sum = θ_s · N.
+        // target_unit = 1 is treated at t = 3 (d[3, 1] = 1). With λ_unit = 0,
+        // ω_j = 1 for unit 0 (untreated at target) plus ω_1 = 1 (target unit),
+        // so Σω = 2 and row sum = θ_s · 2.
         let weights = compute_weight_matrix(
             &y.view(),
             &d.view(),
@@ -911,7 +948,8 @@ mod tests {
 
     /// Numerical cross-validation: compare Twostep weight matrix against
     /// independently computed reference values (T=5, N=4, seed=42,
-    /// target_unit=2, target_period=3, λ_time=0.5, λ_unit=0.5).
+    /// target_unit=2, target_period=3, λ_time=0.5, λ_unit=0.5). Weights are
+    /// unnormalized (Python `diff_diff-3.1.1` local convention).
     #[test]
     fn test_weight_matrix_reference_values() {
         let y = array![
@@ -940,7 +978,7 @@ mod tests {
             &y.view(), &d.view(), 5, 4, 2, 3, 0.5, 0.5, &time_dist.view(),
         );
 
-        // Reference values (tolerance < 1e-10).
+        // Unnormalized reference values (tolerance < 1e-10).
         let reference = [
             [0.088540252840800, 0.102500687323097, 0.223130160148430, 0.144900482487827],
             [0.145978198171795, 0.168995063450973, 0.367879441171442, 0.238900507612393],
@@ -962,8 +1000,7 @@ mod tests {
 
     #[test]
     fn test_weight_numerical_precision() {
-        // Verify individual weight entries against closed-form values
-        // with tolerance < 1e-10.
+        // Unnormalized kernels: W[t, i] = θ_t · ω_i.
         let y = array![[1.0, 2.0], [2.0, 3.0], [3.0, 4.0]];
         let d = array![[0.0, 0.0], [0.0, 0.0], [0.0, 1.0]];
         let time_dist = array![[0i64, 1, 2], [1, 0, 1], [2, 1, 0]];
@@ -972,16 +1009,15 @@ mod tests {
         let target_period = 2;
         let target_unit = 1;
 
-        // θ_s = exp(−λ_time · |target_period − s|)
+        // θ_s = exp(−λ_time · |target_period − s|).
         let expected_time = [
             (-lambda_time * 2.0_f64).exp(),
             (-lambda_time * 1.0_f64).exp(),
             (-lambda_time * 0.0_f64).exp(),
         ];
 
-        // With λ_unit = 0, ω_j = 1 for both units ⟹ row sum = θ_s · 2.
-        let expected_unit_sum = 2.0;
-
+        // λ_unit = 0: unit 0 gets 1 (untreated at target period), target unit 1
+        // also gets 1 (target unit convention). Σω = 2 at each row.
         let weights = compute_weight_matrix(
             &y.view(),
             &d.view(),
@@ -994,35 +1030,22 @@ mod tests {
             &time_dist.view(),
         );
 
-        // Row sums: Σ_j W[t, j] = θ_t · Σ_j ω_j = θ_t · 2.
-        for (t, &expected_t) in expected_time.iter().enumerate().take(3) {
+        for (t, &expected_t) in expected_time.iter().enumerate() {
             let row_sum: f64 = weights.row(t).sum();
-            let expected_row_sum = expected_t * expected_unit_sum;
-            let diff = (row_sum - expected_row_sum).abs();
             assert!(
-                diff < 1e-10,
-                "Time weight precision error at t={}: expected {}, got {}, diff={}",
-                t,
-                expected_row_sum,
-                row_sum,
-                diff
+                (row_sum - expected_t * 2.0).abs() < 1e-10,
+                "Row sum precision error at t={}: expected {}, got {}",
+                t, expected_t * 2.0, row_sum
             );
-        }
 
-        // Individual entries: W[t, j] = θ_t · ω_j.
-        for t in 0..3 {
-            let expected_w0 = expected_time[t] * 1.0;
-            assert!(
-                (weights[[t, 0]] - expected_w0).abs() < 1e-10,
-                "Weight precision error at [{}, 0]",
-                t
-            );
-            let expected_w1 = expected_time[t] * 1.0;
-            assert!(
-                (weights[[t, 1]] - expected_w1).abs() < 1e-10,
-                "Weight precision error at [{}, 1]",
-                t
-            );
+            for j in 0..2 {
+                let expected_w = expected_t * 1.0;
+                assert!(
+                    (weights[[t, j]] - expected_w).abs() < 1e-10,
+                    "Weight precision error at [{}, {}]: expected {}, got {}",
+                    t, j, expected_w, weights[[t, j]]
+                );
+            }
         }
     }
 }
@@ -1144,7 +1167,9 @@ mod proptests {
             }
         }
 
-        /// W[target_period, target_unit] = θ_t(0) · ω_i = 1.0 · 1.0 = 1.0.
+        /// W[target_period, target_unit] = θ_t(0) · ω_i(0) = 1.0 · 1.0 = 1.0
+        /// (target unit is always assigned unit kernel 1; time kernel at
+        /// distance 0 is also 1).
         #[test]
         fn prop_target_unit_weight(
             y in y_matrix_strategy(5, 3),
@@ -1162,7 +1187,6 @@ mod proptests {
                 lambda_time, lambda_unit, &td.view(),
             );
 
-            // θ_{target_period} = exp(0) = 1, ω_{target_unit} = 1 ⟹ W = 1.
             prop_assert!((w[[target_period, target_unit]] - 1.0).abs() < 1e-10,
                 "W[target_period, target_unit] should be 1.0, got {}",
                 w[[target_period, target_unit]]);

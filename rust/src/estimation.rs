@@ -177,8 +177,9 @@ pub fn soft_threshold_svd(m: &Array2<f64>, threshold: f64) -> Option<Array2<f64>
 ///
 /// The alternating minimization proceeds as:
 ///   1. Fix L, update α and β by weighted least squares (Gauss–Seidel).
-///   2. Fix (α, β), update L by proximal gradient with step size η = 1/max(w):
-///      `L ← prox_{η λ ‖·‖_*}(L + η w ⊙ (R − L))`.
+///   2. Fix (α, β), update L by proximal gradient with step size η = 1/(2·max(w))
+///      (Lipschitz constant L_f = 2·max(w) for the unhalved objective):
+///      `L ← prox_{η λ ‖·‖_*}(L + w_norm ⊙ (R − L))`, with threshold = λ/(2·max(w)).
 ///
 /// # Arguments
 /// * `y` - Outcome matrix Y (T × N).
@@ -227,9 +228,24 @@ pub fn estimate_model(
         }
     });
 
-    // Compute step size for proximal gradient: η = 1/max(w)
+    // Per Eq. 2 in Athey, Imbens, Qu & Viviano (2025) the loss is
+    //   f(L) = Σ w_{ti} (R_{ti} − L_{ti})²   (no 1/2 factor),
+    // so ∇f(L) = 2 w ⊙ (L − R) and the Lipschitz constant of ∇f is
+    // L_f = 2·max(w). Proximal gradient uses step size η = 1/L_f =
+    // 1/(2·w_max) and threshold η·λ = λ/(2·w_max).
+    //
+    // `weight_norm` = w/w_max rescales the gradient step so that the
+    // inner update L ← L + weight_norm ⊙ (R − L) has Lipschitz 1
+    // (equivalent to using η = 1 on the rescaled problem). The
+    // proximal threshold must still be η·λ = λ/(2·w_max) on the
+    // original scale.
     let w_max = w_masked.iter().cloned().fold(0.0_f64, f64::max);
-    let eta = if w_max > 0.0 { 1.0 / w_max } else { 1.0 };
+    let weight_norm_factor = if w_max > 0.0 { 1.0 / w_max } else { 1.0 };
+    let prox_threshold = if w_max > 0.0 {
+        lambda_nn / (2.0 * w_max)
+    } else {
+        lambda_nn / 2.0
+    };
 
     // Weight sums per unit and time
     let weight_sum_per_unit: Array1<f64> = w_masked.sum_axis(Axis(0));
@@ -328,10 +344,11 @@ pub fn estimate_model(
                 }
             }
         } else {
-            // Proximal gradient with inner iterations.
-            // Iterates: L_{k+1} = prox_{η λ ‖·‖_*}(L_k + w_norm ⊙ (R_masked − L_k))
-            // Threshold = η λ = λ/w_max.
-            let scaled_threshold = eta * lambda_nn;
+            // FISTA-accelerated proximal gradient for the L subproblem.
+            // Iterates (with Nesterov momentum):
+            //   L_{k+1} = prox_{η λ ‖·‖_*}(L̂_k + w_norm ⊙ (R_masked − L̂_k))
+            // where L̂_k = L_k + ((t_k − 1)/t_{k+1}) (L_k − L_{k−1}),
+            //   w_norm = w / w_max, and threshold = η λ = λ / (2·w_max).
 
             // R_masked: use r_target for valid observations, keep L for invalid ones
             // to prevent L from absorbing signal at zero-weight cells.
@@ -345,26 +362,34 @@ pub fn estimate_model(
 
             // W_norm = W / W_max (normalized weights, max = 1)
             let w_norm = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
-                w_masked[[t, i]] * eta // w * η = w / w_max
+                w_masked[[t, i]] * weight_norm_factor // w / w_max
             });
+
+            let mut l_prev = l.clone();
+            let mut t_fista = 1.0_f64;
 
             for _ in 0..MAX_INNER_ITER {
                 let l_inner_old = l.clone();
 
-                // Gradient step: L + w_norm ⊙ (R_masked − L).
-                // Zero-weight observations remain unchanged (w_norm = 0).
-                let mut gradient_step = Array2::<f64>::zeros((n_periods, n_units));
-                for t in 0..n_periods {
-                    for i in 0..n_units {
-                        gradient_step[[t, i]] =
-                            l[[t, i]] + w_norm[[t, i]] * (r_masked[[t, i]] - l[[t, i]]);
-                    }
-                }
+                // Nesterov momentum extrapolation.
+                let t_fista_new = (1.0 + (1.0 + 4.0 * t_fista * t_fista).sqrt()) / 2.0;
+                let momentum = (t_fista - 1.0) / t_fista_new;
+                let l_momentum = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
+                    l[[t, i]] + momentum * (l[[t, i]] - l_prev[[t, i]])
+                });
 
-                // Proximal step: soft-threshold singular values
-                l = soft_threshold_svd(&gradient_step, scaled_threshold)?;
+                // Gradient step from the momentum point.
+                let gradient_step = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
+                    l_momentum[[t, i]]
+                        + w_norm[[t, i]] * (r_masked[[t, i]] - l_momentum[[t, i]])
+                });
 
-                // Check inner convergence
+                // Proximal step: soft-threshold singular values.
+                l_prev = l.clone();
+                l = soft_threshold_svd(&gradient_step, prox_threshold)?;
+                t_fista = t_fista_new;
+
+                // Check inner convergence against the previous iterate.
                 if max_abs_diff_2d(&l, &l_inner_old) < tol {
                     break;
                 }
@@ -386,48 +411,50 @@ pub fn estimate_model(
     Some((alpha, beta, l, actual_iters, converged))
 }
 
-/// Solve the joint TWFE + treatment model via direct weighted least squares (no low-rank component).
+/// Solve the weighted two-way fixed effects regression over control observations.
 ///
-/// When λ → ∞ (no low-rank term), the joint objective reduces to:
+/// The paper's joint objective (Eq. 2) restricts the quadratic loss to control
+/// cells via the (1 − D) factor. We expect the caller to supply `delta` that
+/// is already multiplied by (1 − D) (e.g. via `compute_joint_weights`). With
+/// that convention the problem reduces to
 ///
 /// ```text
-/// min_{μ,α,β,τ}  Σ_{i,t} δ_{i,t} (Y_{i,t} − μ − α_i − β_t − τ D_{i,t})²
+/// min_{μ, α, β}   Σ_{t, i} δ_{t, i} (Y_{t, i} − μ − α_i − β_t)²
 /// ```
 ///
-/// This is a standard weighted two-way fixed effects regression with a homogeneous
-/// treatment coefficient τ. Solved via LAPACK `dgelsd` (minimum-norm least squares)
-/// for numerical stability with potentially rank-deficient design matrices.
+/// where δ is zero at treated observations. The treatment effect τ is then
+/// obtained post-hoc as the mean residual over treated cells (caller's job).
+///
+/// Solved via LAPACK `dgelsd` (minimum-norm least squares) for numerical
+/// stability with potentially rank-deficient design matrices.
 ///
 /// Identification constraint: α_0 = β_0 = 0 (first unit and time dummy dropped).
 ///
 /// # Arguments
 /// * `y` - Outcome matrix Y (T × N).
-/// * `d` - Treatment indicator matrix D (T × N).
-/// * `delta` - Global weight matrix δ (T × N).
+/// * `delta` - Global weight matrix δ (T × N), already (1 − D)-masked.
 ///
 /// # Returns
-/// `Some((mu, alpha, beta, tau))` on success, `None` if the system is degenerate.
+/// `Some((mu, alpha, beta))` on success, `None` if the system is degenerate.
 pub fn solve_joint_no_lowrank(
     y: &ArrayView2<f64>,
-    d: &ArrayView2<f64>,
     delta: &ArrayView2<f64>,
-) -> Option<(f64, Array1<f64>, Array1<f64>, f64)> {
+) -> Option<(f64, Array1<f64>, Array1<f64>)> {
     let n_periods = y.nrows();
     let n_units = y.ncols();
     let n_obs = n_periods * n_units;
 
-    // Parameter count: 1 (intercept) + (N−1) unit dummies + (T−1) time dummies + 1 (treatment)
-    let n_params = 1 + (n_units - 1) + (n_periods - 1) + 1;
+    // Parameter count: 1 (intercept) + (N−1) unit dummies + (T−1) time dummies.
+    // There is NO treatment column — τ is computed post-hoc as ATT on residuals.
+    let n_params = 1 + (n_units - 1) + (n_periods - 1);
 
     // Vectorize the panel and compute observation weights.
     let mut y_vec = Vec::with_capacity(n_obs);
     let mut w_vec = Vec::with_capacity(n_obs);
-    let mut d_vec = Vec::with_capacity(n_obs);
 
     for t in 0..n_periods {
         for i in 0..n_units {
             let y_ti = y[[t, i]];
-            let d_ti = d[[t, i]];
             let delta_ti = delta[[t, i]];
 
             // Zero weight for non-finite outcomes or weights.
@@ -439,7 +466,6 @@ pub fn solve_joint_no_lowrank(
 
             y_vec.push(y_val);
             w_vec.push(w_val);
-            d_vec.push(d_ti);
         }
     }
 
@@ -478,9 +504,6 @@ pub fn solve_joint_no_lowrank(
             if t > 0 {
                 a_mat[((n_units - 1) + t) * n_obs + obs_idx] = sw;
             }
-
-            // Last column: treatment indicator
-            a_mat[(n_params - 1) * n_obs + obs_idx] = d_vec[obs_idx] * sw;
         }
     }
 
@@ -581,7 +604,6 @@ pub fn solve_joint_no_lowrank(
             if t > 0 {
                 a_mat[((n_units - 1) + t) * n_obs + obs_idx] = sw;
             }
-            a_mat[(n_params - 1) * n_obs + obs_idx] = d_vec[obs_idx] * sw;
         }
     }
 
@@ -624,33 +646,41 @@ pub fn solve_joint_no_lowrank(
         beta[t] = b_vec[(n_units - 1) + t];
     }
 
-    let tau = b_vec[n_params - 1];
-
-    Some((mu, alpha, beta, tau))
+    Some((mu, alpha, beta))
 }
 
-/// Solve the joint TWFE + treatment + low-rank model via alternating minimization.
+/// Solve the joint TWFE + low-rank model via alternating minimization, with
+/// post-hoc τ extraction.
 ///
-/// Minimizes the joint objective with a nuclear norm penalty on the latent factor matrix:
+/// The weight matrix `delta` must already carry the paper's (1 − D) mask so
+/// treated cells contribute zero to the weighted quadratic loss. The objective
+/// solved is therefore the paper's Equation 2 without τ as an explicit
+/// variable:
 ///
 /// ```text
-/// min_{μ,α,β,L,τ}  Σ_{i,t} δ_{i,t} (Y_{i,t} − μ − α_i − β_t − L_{i,t} − τ D_{i,t})²  +  λ ‖L‖_*
+/// min_{μ, α, β, L}   Σ_{t, i} δ_{t, i} (Y_{t, i} − μ − α_i − β_t − L_{t, i})²
+///                  + λ ‖L‖_*
 /// ```
 ///
-/// Alternating minimization:
-///   1. Fix L, solve for (μ, α, β, τ) via WLS (delegates to `solve_joint_no_lowrank`).
-///   2. Fix (μ, α, β, τ), update L by proximal gradient on ‖L‖_*.
+/// Alternating minimization with FISTA acceleration on the L subproblem:
+///   1. Fix L, solve (μ, α, β) via WLS (control-only thanks to δ masking).
+///   2. Fix (μ, α, β), update L via a few FISTA/Nesterov proximal iterations.
+/// After outer convergence we do a final re-solve of (μ, α, β) using the
+/// converged L, then compute τ post-hoc as the mean residual over treated
+/// observations:  τ̂ = mean_{D=1} (Y − μ − α − β − L).
 ///
 /// # Arguments
 /// * `y` - Outcome matrix Y (T × N).
-/// * `d` - Treatment indicator matrix D (T × N).
-/// * `delta` - Global weight matrix δ (T × N).
+/// * `d` - Treatment indicator matrix D (T × N). Used only to locate treated
+///   cells for the post-hoc τ calculation.
+/// * `delta` - Global weight matrix δ (T × N). **Must** already be (1 − D)-masked.
 /// * `lambda_nn` - Nuclear norm penalty parameter λ.
 /// * `max_iter` - Maximum alternating minimization iterations.
 /// * `tol` - Convergence tolerance on max absolute parameter change.
 ///
 /// # Returns
-/// `Some((mu, alpha, beta, L, tau, n_iterations, converged))` on success, `None` on failure.
+/// `Some((mu, alpha, beta, L, tau, n_iterations, converged))` on success,
+/// `None` on failure.
 pub fn solve_joint_with_lowrank(
     y: &ArrayView2<f64>,
     d: &ArrayView2<f64>,
@@ -662,8 +692,8 @@ pub fn solve_joint_with_lowrank(
     let n_periods = y.nrows();
     let n_units = y.ncols();
 
-    // Sanitize Y: replace non-finite values with 0.
-    // Zero the corresponding δ so these positions contribute nothing to the objective.
+    // Sanitize Y: replace non-finite values with 0 for the inner arithmetic.
+    // Zero the corresponding δ so these positions contribute nothing.
     let y_safe = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
         if y[[t, i]].is_finite() { y[[t, i]] } else { 0.0 }
     });
@@ -671,85 +701,181 @@ pub fn solve_joint_with_lowrank(
         if y[[t, i]].is_finite() { delta[[t, i]] } else { 0.0 }
     });
 
-    // Initialize L = 0
+    // Precompute δ_max and the FISTA prox threshold (constant across iterations).
+    // Per paper Eq. 2 (no 1/2 factor): ∇f = 2 δ ⊙ (L − R), Lipschitz constant
+    // L_f = 2·δ_max, optimal step size η = 1/(2·δ_max), and the soft-threshold
+    // value is η λ = λ/(2·δ_max).
+    let delta_max = delta_masked.iter().copied().fold(0.0_f64, f64::max);
+    let prox_threshold = if delta_max > 0.0 {
+        lambda_nn / (2.0 * delta_max)
+    } else {
+        lambda_nn / 2.0
+    };
+
+    // δ_norm = δ / δ_max, used both for the gradient step scaling and for
+    // detecting "active" cells where the R target overrides the current L.
+    let delta_norm = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
+        if delta_max > 0.0 {
+            delta_masked[[t, i]] / delta_max
+        } else {
+            delta_masked[[t, i]]
+        }
+    });
+
+    // Initialize L = 0.
     let mut l = Array2::<f64>::zeros((n_periods, n_units));
 
-    // Store the last iteration's parameters
-    let mut last_mu = 0.0;
-    let mut last_alpha = Array1::<f64>::zeros(n_units);
-    let mut last_beta = Array1::<f64>::zeros(n_periods);
-    let mut last_tau = 0.0;
+    // Store the last iteration's parameters; after the final re-solve below
+    // these are overwritten with the converged values. The `mu` initializer
+    // is a placeholder that always gets replaced either inside the loop or by
+    // the final re-solve; mark the initial assignment as intentionally unused.
+    #[allow(unused_assignments)]
+    let mut mu = 0.0_f64;
+    let mut alpha = Array1::<f64>::zeros(n_units);
+    let mut beta = Array1::<f64>::zeros(n_periods);
 
-    // Track actual iteration count and convergence status
+    // Track actual iteration count and convergence status.
     let mut actual_iters: usize = 0;
     let mut converged = false;
 
     for _ in 0..max_iter {
         actual_iters += 1;
         let l_old = l.clone();
-        // Save previous parameters for convergence check
-        let alpha_old = last_alpha.clone();
-        let beta_old = last_beta.clone();
+        let alpha_old = alpha.clone();
+        let beta_old = beta.clone();
 
-        // Step 1: Fix L, solve for (μ, α, β, τ) via WLS on adjusted outcome Y − L.
-        // Non-finite Y positions have y_safe = 0 and δ_masked = 0, so they contribute nothing.
-        let y_adj = Array2::from_shape_fn((n_periods, n_units), |(t, i)| y_safe[[t, i]] - l[[t, i]]);
-
-        let (mu, alpha, beta, tau) = solve_joint_no_lowrank(&y_adj.view(), d, &delta_masked.view())?;
-
-        last_mu = mu;
-        last_alpha = alpha.clone();
-        last_beta = beta.clone();
-        last_tau = tau;
-
-        // Step 2: Fix (μ, α, β, τ), update L via proximal gradient.
-        // R = Y − μ − α − β − τ D
-        let r = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
-            y_safe[[t, i]] - mu - alpha[i] - beta[t] - tau * d[[t, i]]
+        // Step 1: Fix L, solve for (μ, α, β) via WLS on adjusted outcome Y − L.
+        // δ_masked is (1 − D)-masked at the caller, so this regression uses only
+        // control observations; no τ column is needed.
+        let y_adj = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
+            y_safe[[t, i]] - l[[t, i]]
         });
+        let (mu_new, alpha_new, beta_new) =
+            solve_joint_no_lowrank(&y_adj.view(), &delta_masked.view())?;
+        mu = mu_new;
+        alpha = alpha_new;
+        beta = beta_new;
 
-        // Proximal gradient step for L.
-        // Subproblem: min_L (1/2) Σ δ_{ti} (R_{ti} − L_{ti})² + λ ‖L‖_*
-        // Step size η = 1/δ_max; threshold = η λ = λ/δ_max.
-        // Non-finite Y positions have δ_masked = 0, so δ_max is well-defined.
-        let delta_max = delta_masked.iter().copied().fold(0.0_f64, f64::max);
-        let eta = if delta_max > 0.0 {
-            1.0 / delta_max
-        } else {
-            1.0
-        };
-
-        // gradient_step = L + δ_norm ⊙ (R − L).
-        // Zero-weight positions (including non-finite Y) have δ_norm = 0, leaving L unchanged.
-        let gradient_step = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
-            let delta_norm = if delta_max > 0.0 {
-                delta_masked[[t, i]] / delta_max
+        // Step 2: Fix (μ, α, β), update L via FISTA proximal gradient.
+        // Target residual R = Y − μ − α − β; at zero-weight cells (treated /
+        // non-finite) we substitute the current L so the gradient step leaves
+        // L unchanged in those positions.
+        let r_masked = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
+            if delta_norm[[t, i]] > 0.0 {
+                y_safe[[t, i]] - mu - alpha[i] - beta[t]
             } else {
-                delta_masked[[t, i]]
-            };
-            l[[t, i]] + delta_norm * (r[[t, i]] - l[[t, i]])
+                l[[t, i]]
+            }
         });
 
-        // Soft-threshold singular values.
-        l = soft_threshold_svd(&gradient_step, eta * lambda_nn)?;
+        // FISTA inner loop: max 20 steps, early exit on tol.
+        const MAX_JOINT_INNER_ITER: usize = 20;
+        let mut l_prev = l.clone();
+        let mut t_fista = 1.0_f64;
 
-        // Convergence check on L, α, and β.
+        for _ in 0..MAX_JOINT_INNER_ITER {
+            let l_inner_old = l.clone();
+
+            // Nesterov momentum.
+            let t_fista_new = (1.0 + (1.0 + 4.0 * t_fista * t_fista).sqrt()) / 2.0;
+            let momentum = (t_fista - 1.0) / t_fista_new;
+            let l_momentum = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
+                l[[t, i]] + momentum * (l[[t, i]] - l_prev[[t, i]])
+            });
+
+            // Gradient step from the momentum point.
+            let gradient_step = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
+                l_momentum[[t, i]]
+                    + delta_norm[[t, i]] * (r_masked[[t, i]] - l_momentum[[t, i]])
+            });
+
+            // Proximal step: soft-threshold singular values.
+            l_prev = l.clone();
+            l = soft_threshold_svd(&gradient_step, prox_threshold)?;
+            t_fista = t_fista_new;
+
+            if max_abs_diff_2d(&l, &l_inner_old) < tol {
+                break;
+            }
+        }
+
+        // Outer convergence check on L, α, and β.
         let l_diff = max_abs_diff_2d(&l, &l_old);
-        let alpha_diff = max_abs_diff(&last_alpha, &alpha_old);
-        let beta_diff = max_abs_diff(&last_beta, &beta_old);
+        let alpha_diff = max_abs_diff(&alpha, &alpha_old);
+        let beta_diff = max_abs_diff(&beta, &beta_old);
         if l_diff.max(alpha_diff).max(beta_diff) < tol {
             converged = true;
             break;
         }
     }
 
-    Some((last_mu, last_alpha, last_beta, l, last_tau, actual_iters, converged))
+    // Final re-solve of (μ, α, β) using the converged L so the returned
+    // parameters are mutually consistent (cf. diff-diff 3.1.1 behaviour).
+    let y_adj_final = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
+        y_safe[[t, i]] - l[[t, i]]
+    });
+    let (mu_final, alpha_final, beta_final) =
+        solve_joint_no_lowrank(&y_adj_final.view(), &delta_masked.view())?;
+    mu = mu_final;
+    alpha = alpha_final;
+    beta = beta_final;
+
+    // Post-hoc τ: mean residual over observed treated cells.
+    //   τ̂ = (1 / |T_1|) Σ_{D=1} (Y − μ − α_i − β_t − L_{t, i})
+    let mut tau_sum = 0.0_f64;
+    let mut tau_count: usize = 0;
+    for t in 0..n_periods {
+        for i in 0..n_units {
+            if d[[t, i]] == 1.0 && y[[t, i]].is_finite() {
+                tau_sum += y[[t, i]] - mu - alpha[i] - beta[t] - l[[t, i]];
+                tau_count += 1;
+            }
+        }
+    }
+    let tau = if tau_count > 0 {
+        tau_sum / tau_count as f64
+    } else {
+        0.0
+    };
+
+    Some((mu, alpha, beta, l, tau, actual_iters, converged))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// Helper: compute post-hoc τ = mean residual over observed treated cells.
+    ///
+    /// `l_opt = None` corresponds to the no-low-rank case (L ≡ 0). Tests use
+    /// this to recover τ from the (μ, α, β) returned by `solve_joint_no_lowrank`
+    /// or from an explicit L (e.g., a joint low-rank fit).
+    fn post_hoc_tau(
+        y: &ArrayView2<f64>,
+        d: &ArrayView2<f64>,
+        mu: f64,
+        alpha: &Array1<f64>,
+        beta: &Array1<f64>,
+        l_opt: Option<&Array2<f64>>,
+    ) -> f64 {
+        let mut tau_sum = 0.0_f64;
+        let mut tau_count = 0usize;
+        for t in 0..y.nrows() {
+            for i in 0..y.ncols() {
+                if d[[t, i]] == 1.0 && y[[t, i]].is_finite() {
+                    let l_val = l_opt.map_or(0.0, |m| m[[t, i]]);
+                    tau_sum += y[[t, i]] - mu - alpha[i] - beta[t] - l_val;
+                    tau_count += 1;
+                }
+            }
+        }
+        if tau_count > 0 {
+            tau_sum / tau_count as f64
+        } else {
+            0.0
+        }
+    }
 
     #[test]
     fn test_max_abs_diff() {
@@ -810,10 +936,12 @@ mod tests {
         let d = array![[0.0, 0.0], [0.0, 0.0], [0.0, 1.0]];
         let delta = array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
 
-        let result = solve_joint_no_lowrank(&y.view(), &d.view(), &delta.view());
+        let result = solve_joint_no_lowrank(&y.view(), &delta.view());
         assert!(result.is_some());
 
-        let (_mu, _alpha, _beta, tau) = result.unwrap();
+        let (mu, alpha, beta) = result.unwrap();
+        // Post-hoc τ = mean residual over treated cells.
+        let tau = post_hoc_tau(&y.view(), &d.view(), mu, &alpha, &beta, None);
         // tau should capture the treatment effect
         // The exact value depends on the identification constraints
         assert!(tau.is_finite());
@@ -1023,12 +1151,21 @@ mod tests {
             [0.0, 0.0],
             [0.0, 1.0] // Unit 1 treated at period 3
         ];
-        let delta = array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
+        // δ must be (1 − D)-masked per the new solver contract. Here we zero
+        // the one treated cell (3, 1) so the control-only WLS is well defined.
+        let delta = array![
+            [1.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 0.0]
+        ];
 
-        let result = solve_joint_no_lowrank(&y.view(), &d.view(), &delta.view());
+        let result = solve_joint_no_lowrank(&y.view(), &delta.view());
         assert!(result.is_some(), "Joint estimation should succeed");
 
-        let (_mu, _alpha, _beta, tau) = result.unwrap();
+        let (mu, alpha, beta) = result.unwrap();
+        // Post-hoc τ = mean residual (Y − μ − α − β) over treated cells.
+        let tau = post_hoc_tau(&y.view(), &d.view(), mu, &alpha, &beta, None);
 
         // tau should be close to true_effect
         let diff = (tau - true_effect).abs();
@@ -1103,10 +1240,11 @@ mod tests {
         let d = array![[0.0, 0.0], [0.0, 0.0], [0.0, 1.0]];
         let delta = array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
 
-        let result = solve_joint_no_lowrank(&y.view(), &d.view(), &delta.view());
+        let result = solve_joint_no_lowrank(&y.view(), &delta.view());
         assert!(result.is_some(), "Should handle NaN values");
 
-        let (_mu, _alpha, _beta, tau) = result.unwrap();
+        let (mu, alpha, beta) = result.unwrap();
+        let tau = post_hoc_tau(&y.view(), &d.view(), mu, &alpha, &beta, None);
         assert!(
             tau.is_finite(),
             "tau should be finite even with NaN in data"
@@ -1122,30 +1260,34 @@ mod tests {
         let d = array![[0.0, 0.0], [0.0, 0.0], [0.0, 1.0]];
         let delta_clean = array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
 
-        let result_clean = solve_joint_no_lowrank(&y.view(), &d.view(), &delta_clean.view());
+        let result_clean = solve_joint_no_lowrank(&y.view(), &delta_clean.view());
         assert!(result_clean.is_some(), "Clean case should succeed");
-        let (_, _, _, tau_clean) = result_clean.unwrap();
+        let (mu_c, alpha_c, beta_c) = result_clean.unwrap();
+        let tau_clean = post_hoc_tau(&y.view(), &d.view(), mu_c, &alpha_c, &beta_c, None);
         assert!(tau_clean.is_finite(), "tau should be finite for clean data");
 
         // Case 1: NaN delta at a control position — should be excluded gracefully
         let delta_nan = array![[f64::NAN, 1.0], [1.0, 1.0], [1.0, 1.0]];
-        let result_nan = solve_joint_no_lowrank(&y.view(), &d.view(), &delta_nan.view());
+        let result_nan = solve_joint_no_lowrank(&y.view(), &delta_nan.view());
         assert!(result_nan.is_some(), "NaN delta case should succeed");
-        let (_, _, _, tau_nan) = result_nan.unwrap();
+        let (mu_n, alpha_n, beta_n) = result_nan.unwrap();
+        let tau_nan = post_hoc_tau(&y.view(), &d.view(), mu_n, &alpha_n, &beta_n, None);
         assert!(tau_nan.is_finite(), "tau should be finite with NaN delta");
 
         // Case 2: Inf delta at a control position — should be excluded gracefully
         let delta_inf = array![[f64::INFINITY, 1.0], [1.0, 1.0], [1.0, 1.0]];
-        let result_inf = solve_joint_no_lowrank(&y.view(), &d.view(), &delta_inf.view());
+        let result_inf = solve_joint_no_lowrank(&y.view(), &delta_inf.view());
         assert!(result_inf.is_some(), "Inf delta case should succeed");
-        let (_, _, _, tau_inf) = result_inf.unwrap();
+        let (mu_i, alpha_i, beta_i) = result_inf.unwrap();
+        let tau_inf = post_hoc_tau(&y.view(), &d.view(), mu_i, &alpha_i, &beta_i, None);
         assert!(tau_inf.is_finite(), "tau should be finite with Inf delta");
 
         // Case 3: Negative Inf delta
         let delta_ninf = array![[f64::NEG_INFINITY, 1.0], [1.0, 1.0], [1.0, 1.0]];
-        let result_ninf = solve_joint_no_lowrank(&y.view(), &d.view(), &delta_ninf.view());
+        let result_ninf = solve_joint_no_lowrank(&y.view(), &delta_ninf.view());
         assert!(result_ninf.is_some(), "NegInf delta case should succeed");
-        let (_, _, _, tau_ninf) = result_ninf.unwrap();
+        let (mu_ni, alpha_ni, beta_ni) = result_ninf.unwrap();
+        let tau_ninf = post_hoc_tau(&y.view(), &d.view(), mu_ni, &alpha_ni, &beta_ni, None);
         assert!(tau_ninf.is_finite(), "tau should be finite with NegInf delta");
     }
 

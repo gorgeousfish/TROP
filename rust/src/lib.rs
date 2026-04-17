@@ -708,9 +708,21 @@ pub unsafe extern "C" fn stata_estimate_joint(
         let delta = weights::compute_joint_weights(&y, &d, lt_eff, lu_eff, treated_periods);
 
         // When λ_nn is large enough, skip the low-rank component entirely.
+        // τ is post-hoc: mean residual over treated cells (L ≡ 0 here).
         let result = if ln_eff >= 1e10 {
-            estimation::solve_joint_no_lowrank(&y, &d, &delta.view()).map(
-                |(mu, alpha, beta, tau)| {
+            estimation::solve_joint_no_lowrank(&y, &delta.view()).map(
+                |(mu, alpha, beta)| {
+                    let mut tau_sum = 0.0_f64;
+                    let mut tau_count = 0usize;
+                    for t in 0..np {
+                        for i in 0..nu {
+                            if d[[t, i]] == 1.0 && y[[t, i]].is_finite() {
+                                tau_sum += y[[t, i]] - mu - alpha[i] - beta[t];
+                                tau_count += 1;
+                            }
+                        }
+                    }
+                    let tau = if tau_count > 0 { tau_sum / tau_count as f64 } else { 0.0 };
                     let l = Array2::<f64>::zeros((np, nu));
                     (mu, alpha, beta, l, tau, 1_usize, true)
                 },

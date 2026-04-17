@@ -663,9 +663,30 @@ pub fn bootstrap_trop_variance_joint_full(
             );
 
             // Solve the joint model; branch on whether low-rank is active.
+            //
+            // τ is post-hoc: mean residual (Y − μ − α − β − L) over treated cells.
+            // When λ_nn ≥ 1e10 we skip the low-rank fit and L ≡ 0.
             let result = if ln_eff >= 1e10 {
-                solve_joint_no_lowrank(&y_boot.view(), &d_boot.view(), &delta.view())
-                    .map(|(_, _, _, tau)| tau)
+                solve_joint_no_lowrank(&y_boot.view(), &delta.view()).map(
+                    |(mu, alpha_est, beta)| {
+                        let mut tau_sum = 0.0_f64;
+                        let mut tau_count = 0usize;
+                        let nu_b = y_boot.ncols();
+                        for t in 0..n_periods {
+                            for i in 0..nu_b {
+                                if d_boot[[t, i]] == 1.0 && y_boot[[t, i]].is_finite() {
+                                    tau_sum += y_boot[[t, i]] - mu - alpha_est[i] - beta[t];
+                                    tau_count += 1;
+                                }
+                            }
+                        }
+                        if tau_count > 0 {
+                            tau_sum / tau_count as f64
+                        } else {
+                            f64::NAN
+                        }
+                    },
+                )
             } else {
                 solve_joint_with_lowrank(
                     &y_boot.view(),

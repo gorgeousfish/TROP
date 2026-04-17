@@ -159,11 +159,11 @@ Treated:           8 ( 0.4%)
 Selected hyperparameters (via LOOCV):
   lambda_time =   0.5000
   lambda_unit =   5.0000
-  lambda_nn   =   0.1000
-  Q(lambda_hat) =   3.456566
+  lambda_nn   =   1.0000
+  Q(lambda_hat) =   3.471727
 
 Treatment Effect (ATT):
-  tau     =     0.033572
+  tau     =     0.034188
 ```
 
 **Note:** LOOCV on N = 50, T = 40 typically takes 20–40 minutes. For faster evaluation use `fixedlambda()` or limit search with `max_loocv_samples(500)`.
@@ -284,8 +284,9 @@ For a large panel, use the Penn World Tables democracy dataset:
 ```stata
 use "https://raw.githubusercontent.com/gorgeousfish/TROP/main/data/pwt_loggdp.dta", clear
 
-* Paper's hyperparameters for PWT; add maxiter(200) for large panels
-trop y d, panelvar(id) timevar(t) fixedlambda(0.4 0.3 0.006) maxiter(200)
+* Paper's hyperparameters for PWT. Large panels with very small lambda_nn
+* may require many iterations; use maxiter(1000) for tighter convergence.
+trop y d, panelvar(id) timevar(t) fixedlambda(0.4 0.3 0.006) maxiter(1000)
 ```
 
 Output:
@@ -307,8 +308,17 @@ Fixed hyperparameters (LOOCV skipped):
   lambda_nn   =   0.0060
 
 Treatment Effect (ATT):
-  tau     =    -0.013552
+  tau     =    -0.014818
 ```
+
+> **Convergence note.** With a very small `lambda_nn` (e.g. 0.006), the low-rank
+> factor matrix L can have many nonzero singular values, and the alternating
+> minimization progresses slowly on large panels. The strict `tol(1e-6)` default
+> may not be reached within `maxiter(1000)`; the point estimate is nevertheless
+> stable to the third decimal place. For faster and fully-converged estimates,
+> either (i) increase `lambda_nn` (e.g. `fixedlambda(0.4 0.3 0.1)` converges in
+> about 110 iterations to τ = -0.006672) or (ii) relax the tolerance via
+> `tol(1e-4)`. Verified end-to-end against `diff_diff==3.1.1` (|Δτ| < 4e-7).
 
 **Available datasets** (download via `net get trop`):
 
