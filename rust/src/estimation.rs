@@ -389,6 +389,31 @@ pub fn estimate_model(
                 l = soft_threshold_svd(&gradient_step, prox_threshold)?;
                 t_fista = t_fista_new;
 
+                // Gradient-based adaptive restart (O'Donoghue & Candes 2015,
+                // "Adaptive Restart for Accelerated Gradient Schemes", Found.
+                // Comp. Math.).  FISTA's Nesterov momentum can overshoot on
+                // non-strongly-convex problems, producing oscillations that
+                // slow convergence.  The restart criterion
+                //     ⟨y_k − x_k, x_k − x_{k−1}⟩ > 0
+                // (here y_k = l_momentum, x_k = l, x_{k−1} = l_inner_old)
+                // detects when the proximal step moves in the direction
+                // opposite to the momentum step, signalling that the
+                // accumulated momentum has overshot the optimum.  Resetting
+                // t_fista = 1 clears the momentum without altering the fixed
+                // point.  This yields strictly monotone progress on the
+                // weighted nuclear-norm subproblem and resolves PWT-style
+                // slow convergence at small λ_nn.
+                let mut restart_inner = 0.0_f64;
+                for t in 0..n_periods {
+                    for i in 0..n_units {
+                        restart_inner += (l_momentum[[t, i]] - l[[t, i]])
+                            * (l[[t, i]] - l_inner_old[[t, i]]);
+                    }
+                }
+                if restart_inner > 0.0 {
+                    t_fista = 1.0;
+                }
+
                 // Check inner convergence against the previous iterate.
                 if max_abs_diff_2d(&l, &l_inner_old) < tol {
                     break;
@@ -774,9 +799,13 @@ pub fn solve_joint_with_lowrank(
         let mut t_fista = 1.0_f64;
 
         for _ in 0..MAX_JOINT_INNER_ITER {
+            // Snapshot at the start of this inner step.  Needed both for the
+            // gradient-restart criterion below and (incidentally) for an
+            // unambiguous "progress between two consecutive iterates"
+            // convergence check.
             let l_inner_old = l.clone();
 
-            // Nesterov momentum.
+            // Nesterov momentum extrapolation.
             let t_fista_new = (1.0 + (1.0 + 4.0 * t_fista * t_fista).sqrt()) / 2.0;
             let momentum = (t_fista - 1.0) / t_fista_new;
             let l_momentum = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
@@ -794,6 +823,28 @@ pub fn solve_joint_with_lowrank(
             l = soft_threshold_svd(&gradient_step, prox_threshold)?;
             t_fista = t_fista_new;
 
+            // Gradient-based adaptive restart (O'Donoghue & Candes 2015).
+            // See the equivalent comment in `estimate_model` for the
+            // derivation.  The joint path re-solves (μ, α, β) after every
+            // outer iteration, so FISTA oscillations here propagate into the
+            // outer fixed point — restart is therefore a stability
+            // requirement, not just a convergence accelerator.
+            let mut restart_inner = 0.0_f64;
+            for t in 0..n_periods {
+                for i in 0..n_units {
+                    restart_inner += (l_momentum[[t, i]] - l[[t, i]])
+                        * (l[[t, i]] - l_inner_old[[t, i]]);
+                }
+            }
+            if restart_inner > 0.0 {
+                t_fista = 1.0;
+            }
+
+            // Inner convergence check: |L_new - L_old| across this FISTA
+            // step.  We compare against `l_inner_old` (start-of-step) rather
+            // than the pre-SVD `l_prev`: the former is the quantity whose
+            // decay governs fixed-point progress, which is what the outer
+            // iteration actually needs.
             if max_abs_diff_2d(&l, &l_inner_old) < tol {
                 break;
             }

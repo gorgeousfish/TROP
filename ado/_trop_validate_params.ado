@@ -7,7 +7,7 @@ program define _trop_validate_params
              [LAMbda_time_grid(string) LAMbda_unit_grid(string) ///
               LAMbda_nn_grid(string) BOOTstrap(integer 0) ///
               BSalpha(real 0.05) TOL(real 1e-6) MAXiter(integer 100) ///
-              Max_loocv_samples(integer 0) SEED(integer -1) ///
+              SEED(integer -1) ///
               TOUSE(varname)]
 
     // --- confirm required variables exist in the dataset ---
@@ -127,14 +127,6 @@ program define _trop_validate_params
     if `maxiter' <= 0 {
         di as error "maxiter() must be positive"
         di as error "  Default: 100"
-        exit 198
-    }
-
-    // --- max_loocv_samples(): 0 = all control units; >0 = subsample cap ---
-
-    if `max_loocv_samples' < 0 {
-        di as error "max_loocv_samples() must be non-negative (0=use all, >0=subsample limit)"
-        di as error "  Default: 0 (use all control observations)"
         exit 198
     }
 

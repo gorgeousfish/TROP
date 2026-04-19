@@ -44,11 +44,9 @@ mata set matastrict on
     verbose          -- verbosity level (0 = silent)
 
   Optional arguments
-    max_iter_user          -- iteration limit for the SVD solver (default 100)
-    tol_user               -- convergence tolerance (default 1e-6)
-    alpha_level_user       -- significance level for CIs (default 0.05)
-    max_loocv_samples_user -- cap on control cells used in LOOCV
-                              (default 0 = use all)
+    max_iter_user      -- iteration limit for the SVD solver (default 100)
+    tol_user           -- convergence tolerance (default 1e-6)
+    alpha_level_user   -- significance level for CIs (default 0.05)
 
   Returns
     0 on success; nonzero Stata return code on failure.
@@ -70,14 +68,13 @@ real scalar trop_main(
     real scalar verbose,
     | real scalar max_iter_user,
     real scalar tol_user,
-    real scalar alpha_level_user,
-    real scalar max_loocv_samples_user
+    real scalar alpha_level_user
 )
 {
     real scalar rc, do_loocv, do_bootstrap
     real scalar n_units, n_periods
     real colvector panel_idx, time_idx
-    real scalar max_iter_eff, tol_eff, alpha_eff, max_loocv_eff
+    real scalar max_iter_eff, tol_eff, alpha_eff
     
     // Resolve optional parameters to effective values
     if (args() >= 14 & max_iter_user < . & max_iter_user > 0) max_iter_eff = max_iter_user
@@ -86,9 +83,6 @@ real scalar trop_main(
     else tol_eff = 1e-6
     if (args() >= 16 & alpha_level_user < . & alpha_level_user > 0 & alpha_level_user < 1) alpha_eff = alpha_level_user
     else alpha_eff = 0.05
-    // 0 = use all control observations for LOOCV
-    if (args() >= 17 & max_loocv_samples_user < . & max_loocv_samples_user >= 0) max_loocv_eff = max_loocv_samples_user
-    else max_loocv_eff = 0
     
     // Validate estimation method
     if (method != "twostep" & method != "joint") {
@@ -179,7 +173,7 @@ real scalar trop_main(
     do_bootstrap = (boot_reps > 0)
     
     trop_prepare_options(
-        max_loocv_eff, max_iter_eff, tol_eff, seed, boot_reps, alpha_eff, verbose
+        max_iter_eff, tol_eff, seed, boot_reps, alpha_eff, verbose
     )
     
     if (verbose) {

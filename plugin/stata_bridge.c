@@ -60,6 +60,7 @@ TropCommand parse_command(const char *cmd) {
     
     if (strcmp(cmd, "loocv_twostep") == 0) return CMD_LOOCV_TWOSTEP;
     if (strcmp(cmd, "loocv_joint") == 0) return CMD_LOOCV_JOINT;
+    if (strcmp(cmd, "loocv_joint_exhaustive") == 0) return CMD_LOOCV_JOINT_EXHAUSTIVE;
     if (strcmp(cmd, "estimate_twostep") == 0) return CMD_ESTIMATE_TWOSTEP;
     if (strcmp(cmd, "estimate_joint") == 0) return CMD_ESTIMATE_JOINT;
     if (strcmp(cmd, "bootstrap_twostep") == 0) return CMD_BOOTSTRAP_TWOSTEP;
@@ -553,11 +554,10 @@ static ST_retcode handle_loocv_twostep(void) {
     double *lambda_unit_grid = NULL;
     double *lambda_nn_grid = NULL;
     int lambda_time_len, lambda_unit_len, lambda_nn_len;
-    double max_loocv_samples_d, max_iter_d, tol, seed_d;
-    int max_loocv_samples, max_iter;
-    uint64_t seed;
+    double max_iter_d, tol;
+    int max_iter;
     double best_time, best_unit, best_nn, best_score;
-    int n_valid, n_attempted, n_control_total, subsampled;
+    int n_valid, n_attempted;
     int first_failed_t, first_failed_i;  /* first failed LOOCV observation indices */
     ST_retcode rc;
     int rust_rc;
@@ -618,14 +618,10 @@ static ST_retcode handle_loocv_twostep(void) {
     convert_lambda_infinity(lambda_nn_grid, lambda_nn_len, "nn");
     
     /* Read algorithm parameters */
-    SF_scal_use("__trop_max_loocv_samples", &max_loocv_samples_d);
     SF_scal_use("__trop_max_iter", &max_iter_d);
     SF_scal_use("__trop_tol", &tol);
-    SF_scal_use("__trop_seed", &seed_d);
     
-    max_loocv_samples = (int)max_loocv_samples_d;
     max_iter = (int)max_iter_d;
-    seed = (uint64_t)seed_d;
     
     rust_rc = stata_loocv_grid_search(
         y_matrix, d_matrix, control_mask, time_dist,
@@ -633,9 +629,9 @@ static ST_retcode handle_loocv_twostep(void) {
         lambda_time_grid, lambda_time_len,
         lambda_unit_grid, lambda_unit_len,
         lambda_nn_grid, lambda_nn_len,
-        max_loocv_samples, max_iter, tol, seed,
+        max_iter, tol,
         &best_time, &best_unit, &best_nn, &best_score,
-        &n_valid, &n_attempted, &n_control_total, &subsampled,
+        &n_valid, &n_attempted,
         &first_failed_t, &first_failed_i
     );
     
@@ -652,15 +648,12 @@ static ST_retcode handle_loocv_twostep(void) {
     SF_scal_save("__trop_loocv_score", best_score);
     SF_scal_save("__trop_loocv_n_valid", (double)n_valid);
     SF_scal_save("__trop_loocv_n_attempted", (double)n_attempted);
-    /* Save LOOCV diagnostic scalars */
-    SF_scal_save("__trop_loocv_n_control_total", (double)n_control_total);
-    SF_scal_save("__trop_loocv_subsampled", (double)subsampled);
     /* First failed observation indices (for diagnostics) */
     SF_scal_save("__trop_loocv_first_failed_t", (double)first_failed_t);
     SF_scal_save("__trop_loocv_first_failed_i", (double)first_failed_i);
     
-    TROP_LOG_INFO("LOOCV complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, n_control_total=%d, subsampled=%d, first_failed=(%d,%d)",
-                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, n_control_total, subsampled, first_failed_t, first_failed_i);
+    TROP_LOG_INFO("LOOCV complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, first_failed=(%d,%d)",
+                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, first_failed_t, first_failed_i);
     
     rc = TROP_SUCCESS;
     
@@ -689,11 +682,10 @@ static ST_retcode handle_loocv_joint(void) {
     double *lambda_unit_grid = NULL;
     double *lambda_nn_grid = NULL;
     int lambda_time_len, lambda_unit_len, lambda_nn_len;
-    double max_loocv_samples_d, max_iter_d, tol, seed_d;
-    int max_loocv_samples, max_iter;
-    uint64_t seed;
+    double max_iter_d, tol;
+    int max_iter;
     double best_time, best_unit, best_nn, best_score;
-    int n_valid, n_attempted, n_control_total, subsampled;
+    int n_valid, n_attempted;
     int first_failed_t, first_failed_i;  /* first failed LOOCV observation indices */
     ST_retcode rc;
     int rust_rc;
@@ -749,14 +741,10 @@ static ST_retcode handle_loocv_joint(void) {
     convert_lambda_infinity(lambda_nn_grid, lambda_nn_len, "nn");
     
     /* Read algorithm parameters */
-    SF_scal_use("__trop_max_loocv_samples", &max_loocv_samples_d);
     SF_scal_use("__trop_max_iter", &max_iter_d);
     SF_scal_use("__trop_tol", &tol);
-    SF_scal_use("__trop_seed", &seed_d);
     
-    max_loocv_samples = (int)max_loocv_samples_d;
     max_iter = (int)max_iter_d;
-    seed = (uint64_t)seed_d;
     
     /* Call Rust: two-stage coordinate descent over lambda grid.
      * max_cycles=10 controls the number of coordinate descent iterations. */
@@ -766,10 +754,10 @@ static ST_retcode handle_loocv_joint(void) {
         lambda_time_grid, lambda_time_len,
         lambda_unit_grid, lambda_unit_len,
         lambda_nn_grid, lambda_nn_len,
-        max_loocv_samples, max_iter, tol, seed,
+        max_iter, tol,
         10, /* max_cycles: coordinate descent iterations */
         &best_time, &best_unit, &best_nn, &best_score,
-        &n_valid, &n_attempted, &n_control_total, &subsampled,
+        &n_valid, &n_attempted,
         &first_failed_t, &first_failed_i
     );
     
@@ -787,14 +775,143 @@ static ST_retcode handle_loocv_joint(void) {
     /* Save LOOCV diagnostic scalars */
     SF_scal_save("__trop_loocv_n_valid", (double)n_valid);
     SF_scal_save("__trop_loocv_n_attempted", (double)n_attempted);
-    SF_scal_save("__trop_loocv_n_control_total", (double)n_control_total);
-    SF_scal_save("__trop_loocv_subsampled", (double)subsampled);
     /* First failed observation indices (for diagnostics) */
     SF_scal_save("__trop_loocv_first_failed_t", (double)first_failed_t);
     SF_scal_save("__trop_loocv_first_failed_i", (double)first_failed_i);
     
-    TROP_LOG_INFO("LOOCV complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, n_control_total=%d, subsampled=%d, first_failed=(%d,%d)",
-                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, n_control_total, subsampled, first_failed_t, first_failed_i);
+    TROP_LOG_INFO("LOOCV complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, first_failed=(%d,%d)",
+                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, first_failed_t, first_failed_i);
+    
+    rc = TROP_SUCCESS;
+    
+cleanup:
+    free(y_matrix);
+    free(d_matrix);
+    free(control_mask);
+    free(lambda_time_grid);
+    free(lambda_unit_grid);
+    free(lambda_nn_grid);
+    
+    return rc;
+}
+
+
+/* ============================================================================
+ * Command Handler: LOOCV Joint (Exhaustive / Cartesian)
+ * ============================================================================ */
+
+/**
+ * Exhaustive (Cartesian) grid search variant of handle_loocv_joint.
+ *
+ * Reads the same Stata scalars/matrices as handle_loocv_joint (no max_cycles
+ * needed), then calls stata_loocv_grid_search_joint which enumerates all
+ * |grid|^3 triples in parallel.  Writes identical output scalars so the
+ * downstream Mata/ADO layers are agnostic to which strategy was used.
+ */
+static ST_retcode handle_loocv_joint_exhaustive(void) {
+    ST_int n_units, n_periods;
+    double *y_matrix = NULL;
+    double *d_matrix = NULL;
+    unsigned char *control_mask = NULL;
+    double *lambda_time_grid = NULL;
+    double *lambda_unit_grid = NULL;
+    double *lambda_nn_grid = NULL;
+    int lambda_time_len, lambda_unit_len, lambda_nn_len;
+    double max_iter_d, tol;
+    int max_iter;
+    double best_time, best_unit, best_nn, best_score;
+    int n_valid, n_attempted;
+    int first_failed_t, first_failed_i;
+    ST_retcode rc;
+    int rust_rc;
+    
+    first_failed_t = -1;
+    first_failed_i = -1;
+    
+    TROP_LOG_INFO("starting LOOCV exhaustive grid search (joint)");
+    
+    /* Read dimensions */
+    rc = read_dimensions(&n_units, &n_periods);
+    if (rc != TROP_SUCCESS) goto cleanup;
+    
+    /* Allocate memory (no time_dist for joint method) */
+    y_matrix = (double *)malloc(n_units * n_periods * sizeof(double));
+    d_matrix = (double *)malloc(n_units * n_periods * sizeof(double));
+    control_mask = (unsigned char *)malloc(n_units * n_periods);
+    
+    if (!y_matrix || !d_matrix || !control_mask) {
+        TROP_LOG_ERROR("memory allocation failed");
+        rc = TROP_ERR_MEMORY;
+        goto cleanup;
+    }
+    
+    /* Read data */
+    double y_idx_d, d_idx_d, ctrl_idx_d;
+    SF_scal_use("__trop_y_varindex", &y_idx_d);
+    SF_scal_use("__trop_d_varindex", &d_idx_d);
+    SF_scal_use("__trop_ctrl_varindex", &ctrl_idx_d);
+    
+    rc = read_panel_to_matrix((ST_int)y_idx_d, n_periods, n_units, y_matrix);
+    if (rc != TROP_SUCCESS) goto cleanup;
+    
+    rc = read_panel_to_matrix((ST_int)d_idx_d, n_periods, n_units, d_matrix);
+    if (rc != TROP_SUCCESS) goto cleanup;
+    
+    rc = read_control_mask((ST_int)ctrl_idx_d, n_periods, n_units, control_mask);
+    if (rc != TROP_SUCCESS) goto cleanup;
+    
+    /* Read lambda grids */
+    rc = read_lambda_grid("__trop_lambda_time_grid", &lambda_time_grid, &lambda_time_len);
+    if (rc != TROP_SUCCESS) goto cleanup;
+    
+    rc = read_lambda_grid("__trop_lambda_unit_grid", &lambda_unit_grid, &lambda_unit_len);
+    if (rc != TROP_SUCCESS) goto cleanup;
+    
+    rc = read_lambda_grid("__trop_lambda_nn_grid", &lambda_nn_grid, &lambda_nn_len);
+    if (rc != TROP_SUCCESS) goto cleanup;
+    
+    /* Convert infinity sentinel values in grids */
+    convert_lambda_infinity(lambda_time_grid, lambda_time_len, "time");
+    convert_lambda_infinity(lambda_unit_grid, lambda_unit_len, "unit");
+    convert_lambda_infinity(lambda_nn_grid, lambda_nn_len, "nn");
+    
+    /* Read algorithm parameters */
+    SF_scal_use("__trop_max_iter", &max_iter_d);
+    SF_scal_use("__trop_tol", &tol);
+    
+    max_iter = (int)max_iter_d;
+    
+    /* Call Rust: exhaustive Cartesian search over the full grid. */
+    rust_rc = stata_loocv_grid_search_joint(
+        y_matrix, d_matrix, control_mask,
+        n_periods, n_units,
+        lambda_time_grid, lambda_time_len,
+        lambda_unit_grid, lambda_unit_len,
+        lambda_nn_grid, lambda_nn_len,
+        max_iter, tol,
+        &best_time, &best_unit, &best_nn, &best_score,
+        &n_valid, &n_attempted,
+        &first_failed_t, &first_failed_i
+    );
+    
+    if (rust_rc != TROP_SUCCESS) {
+        translate_error_code(rust_rc);
+        rc = rust_rc;
+        goto cleanup;
+    }
+    
+    /* Write results (identical schema to handle_loocv_joint) */
+    SF_scal_save("__trop_lambda_time", best_time);
+    SF_scal_save("__trop_lambda_unit", best_unit);
+    SF_scal_save("__trop_lambda_nn", best_nn);
+    SF_scal_save("__trop_loocv_score", best_score);
+    SF_scal_save("__trop_loocv_n_valid", (double)n_valid);
+    SF_scal_save("__trop_loocv_n_attempted", (double)n_attempted);
+    SF_scal_save("__trop_loocv_first_failed_t", (double)first_failed_t);
+    SF_scal_save("__trop_loocv_first_failed_i", (double)first_failed_i);
+    
+    TROP_LOG_INFO("LOOCV (exhaustive) complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, first_failed=(%d,%d)",
+                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, first_failed_t, first_failed_i);
     
     rc = TROP_SUCCESS;
     
@@ -824,6 +941,8 @@ static ST_retcode handle_estimate_twostep(void) {
     double *alpha = NULL;
     double *beta = NULL;
     double *l_matrix = NULL;
+    int *converged_by_obs = NULL;
+    int *n_iters_by_obs = NULL;
     double lambda_time, lambda_unit, lambda_nn;
     double max_iter_d, tol;
     int max_iter;
@@ -849,9 +968,13 @@ static ST_retcode handle_estimate_twostep(void) {
     alpha = (double *)malloc(n_units * sizeof(double));
     beta = (double *)malloc(n_periods * sizeof(double));
     l_matrix = (double *)malloc(n_units * n_periods * sizeof(double));
+    /* Per-obs diagnostics: sized at the N*T upper bound on treated cells. */
+    converged_by_obs = (int *)malloc((size_t)n_units * (size_t)n_periods * sizeof(int));
+    n_iters_by_obs   = (int *)malloc((size_t)n_units * (size_t)n_periods * sizeof(int));
     
     if (!y_matrix || !d_matrix || !control_mask || !time_dist ||
-        !tau || !alpha || !beta || !l_matrix) {
+        !tau || !alpha || !beta || !l_matrix ||
+        !converged_by_obs || !n_iters_by_obs) {
         TROP_LOG_ERROR("memory allocation failed");
         rc = TROP_ERR_MEMORY;
         goto cleanup;
@@ -894,7 +1017,8 @@ static ST_retcode handle_estimate_twostep(void) {
         lambda_time, lambda_unit, lambda_nn,
         max_iter, tol,
         &att, tau, alpha, beta, l_matrix,
-        &n_treated, &n_iterations, &converged
+        &n_treated, &n_iterations, &converged,
+        converged_by_obs, n_iters_by_obs
     );
     
     if (rust_rc != TROP_SUCCESS) {
@@ -909,6 +1033,23 @@ static ST_retcode handle_estimate_twostep(void) {
     /* n_iterations: maximum iterations across all treated observations */
     SF_scal_save("__trop_n_iterations", (double)n_iterations);
     SF_scal_save("__trop_converged", (double)converged);
+
+    /* Per-obs diagnostics (N_treated × 1) — always written so Mata can
+     * decide whether to surface a message.  Converted to double for Stata. */
+    if (n_treated > 0) {
+        double *tmp = (double *)malloc((size_t)n_treated * sizeof(double));
+        if (tmp != NULL) {
+            int k;
+            for (k = 0; k < n_treated; k++) tmp[k] = (double)converged_by_obs[k];
+            rc = write_vector_to_matrix("__trop_converged_by_obs", tmp, n_treated, 0);
+            if (rc == TROP_SUCCESS) {
+                for (k = 0; k < n_treated; k++) tmp[k] = (double)n_iters_by_obs[k];
+                rc = write_vector_to_matrix("__trop_n_iters_by_obs", tmp, n_treated, 0);
+            }
+            free(tmp);
+            if (rc != TROP_SUCCESS) goto cleanup;
+        }
+    }
     
     /* Count ever-treated units vs treated observations (unit-period pairs).
      * __trop_n_treated      = treated observations (for degrees of freedom).
@@ -1018,6 +1159,8 @@ cleanup:
     free(alpha);
     free(beta);
     free(l_matrix);
+    free(converged_by_obs);
+    free(n_iters_by_obs);
     
     return rc;
 }
@@ -1033,11 +1176,13 @@ static ST_retcode handle_estimate_joint(void) {
     double *alpha = NULL;
     double *beta = NULL;
     double *l_matrix = NULL;
+    double *tau_vec = NULL;
     double lambda_time, lambda_unit, lambda_nn;
     double max_iter_d, tol;
     int max_iter;
     double tau, mu;
     int n_iterations, converged;
+    int n_treated_cells = 0;
     ST_retcode rc;
     int rust_rc;
     
@@ -1053,8 +1198,10 @@ static ST_retcode handle_estimate_joint(void) {
     alpha = (double *)malloc(n_units * sizeof(double));
     beta = (double *)malloc(n_periods * sizeof(double));
     l_matrix = (double *)malloc(n_units * n_periods * sizeof(double));
+    /* Upper bound for treated cells: N*T; caller writes ≤ n_treated_cells. */
+    tau_vec = (double *)malloc((size_t)n_units * (size_t)n_periods * sizeof(double));
     
-    if (!y_matrix || !d_matrix || !alpha || !beta || !l_matrix) {
+    if (!y_matrix || !d_matrix || !alpha || !beta || !l_matrix || !tau_vec) {
         TROP_LOG_ERROR("memory allocation failed");
         rc = TROP_ERR_MEMORY;
         goto cleanup;
@@ -1087,7 +1234,8 @@ static ST_retcode handle_estimate_joint(void) {
         lambda_time, lambda_unit, lambda_nn,
         max_iter, tol,
         &tau, &mu, alpha, beta, l_matrix,
-        &n_iterations, &converged
+        &n_iterations, &converged,
+        tau_vec, &n_treated_cells
     );
     
     if (rust_rc != TROP_SUCCESS) {
@@ -1096,26 +1244,36 @@ static ST_retcode handle_estimate_joint(void) {
         goto cleanup;
     }
     
-    /* Count treated observations from D matrix.
-     * Uses column-major indexing d_matrix[i * n_periods + t] consistent
-     * with read_panel_to_matrix storage.  Counts ALL D==1 cells
-     * (unit-period pairs), used for t-distribution degrees of freedom. */
-    int n_treated_obs = 0;
-    for (ST_int i = 0; i < n_units; i++) {
-        for (ST_int t = 0; t < n_periods; t++) {
-            if (d_matrix[i * n_periods + t] == 1.0) {
-                n_treated_obs++;
+    /* n_treated_cells was written by Rust; fall back to a scan in the unlikely
+     * event it is non-positive (e.g. null pointer path). */
+    int n_treated_obs = n_treated_cells;
+    if (n_treated_obs <= 0) {
+        for (ST_int i = 0; i < n_units; i++) {
+            for (ST_int t = 0; t < n_periods; t++) {
+                if (d_matrix[i * n_periods + t] == 1.0) {
+                    n_treated_obs++;
+                }
             }
         }
     }
     
-    /* Write results */
-    SF_scal_save("__trop_att", tau);  /* Joint: scalar tau is the ATT */
-    SF_scal_save("__trop_tau", tau);
+    /* Write results.
+     *
+     * Paper Eq 13 defines τ per treated (i,t) cell; Eq 1 aggregates them to
+     * ATT = mean(τ_it).  __trop_att carries the scalar; __trop_tau becomes a
+     * N_treated × 1 matrix so Mata-side consumers (e(tau)) see the same
+     * representation as for method("twostep"). */
+    SF_scal_save("__trop_att", tau);
     SF_scal_save("__trop_mu", mu);
-    SF_scal_save("__trop_n_treated", (double)n_treated_obs);  /* treated obs count for df */
+    SF_scal_save("__trop_n_treated", (double)n_treated_obs);
     SF_scal_save("__trop_n_iterations", (double)n_iterations);
     SF_scal_save("__trop_converged", (double)converged);
+    
+    /* Write per-cell τ vector as a Stata matrix (N_treated × 1). */
+    if (n_treated_obs > 0) {
+        rc = write_vector_to_matrix("__trop_tau", tau_vec, n_treated_obs, 0);
+        if (rc != TROP_SUCCESS) goto cleanup;
+    }
     
     /* Count ever-treated units (units with at least one D==1 cell). */
     {
@@ -1188,6 +1346,7 @@ cleanup:
     free(alpha);
     free(beta);
     free(l_matrix);
+    free(tau_vec);
     
     return rc;
 }
@@ -1573,6 +1732,10 @@ STDLL stata_call(int argc, char *argv[]) {
             
         case CMD_LOOCV_JOINT:
             rc = handle_loocv_joint();
+            break;
+            
+        case CMD_LOOCV_JOINT_EXHAUSTIVE:
+            rc = handle_loocv_joint_exhaustive();
             break;
             
         case CMD_ESTIMATE_TWOSTEP:

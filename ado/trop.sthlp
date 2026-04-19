@@ -34,7 +34,7 @@
 {synopt:{opth timevar(varname)}}time period identifier{p_end}
 
 {syntab:Estimation Method}
-{synopt:{opt method(twostep|joint)}}estimation method; default is {cmd:twostep}{p_end}
+{synopt:{opt method(twostep|joint|local|global)}}estimation method; default is {cmd:twostep}.  {cmd:local} is an alias for {cmd:twostep} and {cmd:global} for {cmd:joint}, matching the paper terminology.{p_end}
 
 {syntab:Lambda Grid Settings}
 {synopt:{opt grid_style(default|extended)}}preset lambda grid; default is {cmd:default}{p_end}
@@ -44,12 +44,12 @@
 
 {syntab:LOOCV Control}
 {synopt:{opth fixedlambda(numlist)}}skip LOOCV; use fixed lambda values (3 values){p_end}
-{synopt:{opt max_loocv_samples(#)}}maximum LOOCV subsamples; default is {cmd:0}{p_end}
+{synopt:{opt joint_loocv(cycling|exhaustive)}}joint-method LOOCV search strategy; default is {cmd:cycling}{p_end}
 {synopt:{opt tol(#)}}convergence tolerance; default is {cmd:1e-6}{p_end}
 {synopt:{opt maxiter(#)}}maximum iterations; default is {cmd:100}{p_end}
 
 {syntab:Bootstrap Inference}
-{synopt:{opt bootstrap(#)}}bootstrap replications; default is {cmd:0} (disabled){p_end}
+{synopt:{opt bootstrap(#)}}bootstrap replications (paper Alg 3); default is {cmd:200}; set {cmd:0} to skip{p_end}
 
 {syntab:Other}
 {synopt:{opt seed(#)}}random number seed; default is {cmd:42}{p_end}
@@ -106,7 +106,11 @@ periods.
 {dlgtab:Estimation Method}
 
 {phang}
-{opt method(twostep|joint)} specifies the estimation method.
+{opt method(twostep|joint|local|global)} specifies the estimation method.
+Paper-consistent aliases are accepted: {cmd:local} is identical to {cmd:twostep}
+(per-observation weights, Algorithm 2) and {cmd:global} is identical to
+{cmd:joint} (shared-weight estimator, Remark 6.1).  Any other value is
+rejected with r(198).
 
 {pmore}
 {opt twostep} (default) uses per-observation weights following Algorithm 2.
@@ -135,15 +139,48 @@ more expensive.
 
 {phang}
 {opth lambda_time_grid(numlist)} specifies custom values for lambda_time.
-Overrides {opt grid_style()} for this parameter.
+Overrides {opt grid_style()} for this parameter.  Values must be finite and
+non-negative: Stata missing ({cmd:.}) is rejected at parse time because the
+corresponding degenerate kernel has no counterpart in paper Eq. (3) or the
+{cmd:diff-diff 3.1.1} Python reference.
 
 {phang}
 {opth lambda_unit_grid(numlist)} specifies custom values for lambda_unit.
-Overrides {opt grid_style()} for this parameter.
+Same finiteness requirement as {opt lambda_time_grid()}: Stata missing is
+rejected at parse time.
 
 {phang}
 {opth lambda_nn_grid(numlist)} specifies custom values for lambda_nn (nuclear
-norm penalty). Overrides {opt grid_style()} for this parameter.
+norm penalty). Overrides {opt grid_style()} for this parameter.  Stata
+missing ({cmd:.}) is accepted and interpreted as +infinity (following the
+Python {cmd:diff-diff} reference), which zeros the low-rank component L and
+yields the classical DID / synthetic-control special case; the default grid
+now includes this corner automatically.
+
+{phang}
+{opt joint_loocv(cycling|exhaustive)} selects the LOOCV search strategy for
+the joint method. Only effective when {opt method(joint)} is combined with
+LOOCV (that is, {opt fixedlambda()} is not specified).
+
+{pmore}
+{opt cycling} (default) runs a two-stage coordinate-descent search adapted
+from Footnote 2 of Athey et al. (2025): univariate sweeps with extreme
+fixed values produce initial estimates, then each parameter is updated
+cyclically while the others are held at their current optimum. Cost is
+O(|grid| * max_cycles).
+
+{pmore}
+{opt exhaustive} evaluates every (lambda_time, lambda_unit, lambda_nn)
+combination in the Cartesian product of the three grids in parallel.
+This reproduces the behaviour of {bf:diff-diff 3.1.1} ({bf:trop_global})
+exactly and is guaranteed to reach the global minimum of the LOOCV
+criterion over the given grid. Cost is O(|grid|^3) and may be expensive
+on dense grids.
+
+{pmore}
+For the twostep method the cycling strategy is used unconditionally
+because Footnote 2 applies directly; {opt joint_loocv()} is parsed but
+has no effect in that case.
 
 {pmore}
 {bf:Infinity values:} Use {cmd:.} (missing) or {cmd:1e10} to represent
@@ -160,16 +197,9 @@ Exactly 3 non-negative values must be provided.
 {pmore}
 Example: {cmd:fixedlambda(0.5 1.0 0.1)} sets lambda_time=0.5,
 lambda_unit=1.0, lambda_nn=0.1. When this option is specified,
-{opt grid_style()} and {opt max_loocv_samples()} are ignored.
+{opt grid_style()} is ignored.
 {opt tol()} and {opt maxiter()} still apply to the alternating minimization
 in the estimation step.
-
-{phang}
-{opt max_loocv_samples(#)} specifies the maximum number of control
-observations to use in LOOCV. Default is {cmd:0}, which uses all control
-observations (no subsampling), corresponding to the full criterion in
-Eq. (5). Set to a positive integer (e.g., 500) to subsample for faster
-computation on very large panels.
 
 {phang}
 {opt tol(#)} specifies the convergence tolerance for the alternating
@@ -183,10 +213,36 @@ alternating minimization algorithm. Default is {cmd:100}.
 
 {phang}
 {opt bootstrap(#)} specifies the number of bootstrap replications for
-variance estimation following Algorithm 3 of the paper. Default is {cmd:0}
-(disabled). Set to a positive integer (e.g., 200) to enable bootstrap
-inference. The bootstrap constructs each replicate by sampling N_0 control
+variance estimation following Algorithm 3 of the paper. Default is {cmd:200}.
+Set to {cmd:0} to skip bootstrap inference; the point estimate is still
+returned but standard errors, p-values, and confidence intervals are not
+computed. The bootstrap constructs each replicate by sampling N_0 control
 units with replacement and N_1 treated units with replacement separately.
+
+{pmore}
+{bf:Confidence intervals.} When bootstrap is enabled, two complementary
+intervals are reported and stored:
+
+{phang2}
+(a) A {it:t-based} CI {cmd:e(ci_lower)}/{cmd:e(ci_upper)} computed as
+{cmd:att} {bf:{c 177}} {it:t}_{it:df_r}(1-alpha/2) * {cmd:se}, using the
+bootstrap standard error and the t-distribution with {cmd:e(df_r)} degrees
+of freedom. This is the primary interval and is consistent with Stata's
+conventions (post-estimation commands such as {cmd:test} and {cmd:lincom}
+read it through {cmd:e(V)}).
+
+{phang2}
+(b) A {it:percentile} CI {cmd:e(ci_lower_percentile)}/{cmd:e(ci_upper_percentile)}
+taken directly from the alpha/2 and 1-alpha/2 quantiles of the bootstrap
+distribution, as prescribed by Algorithm 3 of Athey et al. (2025). This
+interval makes no distributional assumption and is distribution-free under
+the bootstrap exchangeability assumption.
+
+{pmore}
+Both intervals use the same confidence level {cmd:level()} and are shown
+side-by-side in the results output. Large discrepancies between the two
+suggest asymmetry or heavy tails in the bootstrap distribution and warrant
+investigation.
 
 {dlgtab:Other}
 
@@ -313,6 +369,11 @@ The {opt extended} grid covers all optimal values from Table 2 of the paper:
 {phang2}{cmd:. trop y d, panelvar(id) timevar(t) method(joint) seed(42)}{p_end}
 
 {pstd}
+{bf:Joint method with exhaustive LOOCV (matches Python diff-diff 3.1.1)}
+
+{phang2}{cmd:. trop y d, panelvar(id) timevar(t) method(joint) joint_loocv(exhaustive) seed(42)}{p_end}
+
+{pstd}
 {bf:With bootstrap inference}
 
 {phang2}{cmd:. trop y d, panelvar(id) timevar(t) bootstrap(200) seed(42)}{p_end}
@@ -337,6 +398,26 @@ The {opt extended} grid covers all optimal values from Table 2 of the paper:
 
 {phang2}{cmd:. trop y d, panelvar(id) timevar(t) seed(42) verbose}{p_end}
 
+{pstd}
+{bf:Per-cell treatment effects via {cmd:e(tau_matrix)}}
+
+{pstd}
+{cmd:e(tau_matrix)} is a {it:T x N} matrix indexed by (time, panel) with
+treatment effects in treated cells and Stata missing ({cmd:.}) elsewhere.
+Use it to retrieve tau by coordinate or to aggregate effects by row/column:
+
+{phang2}{cmd:. trop y d, panelvar(id) timevar(t) seed(42)}{p_end}
+{phang2}{cmd:. matrix tauM = e(tau_matrix)         // T x N panel-shaped tau}{p_end}
+{phang2}{cmd:. di "tau at (t=8, i=85) = " tauM[8, 85]}{p_end}
+
+{pstd}
+Average treatment effect within each post-treatment period (event-time path):
+
+{phang2}{cmd:. mata: tau = st_matrix("e(tau_matrix)")}{p_end}
+{phang2}{cmd:. mata: present = (tau :< .)                       // 1 if treated cell}{p_end}
+{phang2}{cmd:. mata: att_t = rowsum(editmissing(tau, 0)) :/ rowsum(present)}{p_end}
+{phang2}{cmd:. mata: att_t                                       // T x 1 (missing for pre-treatment rows)}{p_end}
+
 
 {marker results}{...}
 {title:Stored results}
@@ -349,26 +430,23 @@ The {opt extended} grid covers all optimal values from Table 2 of the paper:
 {synopt:{cmd:e(att)}}ATT point estimate{p_end}
 {synopt:{cmd:e(se)}}bootstrap standard error{p_end}
 {synopt:{cmd:e(t)}}t statistic (att/se){p_end}
-{synopt:{cmd:e(ci_lower)}}confidence interval lower bound{p_end}
-{synopt:{cmd:e(ci_upper)}}confidence interval upper bound{p_end}
+{synopt:{cmd:e(ci_lower)}}t-based confidence interval lower bound (primary){p_end}
+{synopt:{cmd:e(ci_upper)}}t-based confidence interval upper bound (primary){p_end}
 {synopt:{cmd:e(pvalue)}}two-sided p-value{p_end}
 {synopt:{cmd:e(df_r)}}degrees of freedom for t-distribution{p_end}
-{synopt:{cmd:e(ci_lower_percentile)}}bootstrap percentile CI lower bound{p_end}
-{synopt:{cmd:e(ci_upper_percentile)}}bootstrap percentile CI upper bound{p_end}
+{synopt:{cmd:e(ci_lower_percentile)}}bootstrap percentile CI lower bound (paper Alg 3){p_end}
+{synopt:{cmd:e(ci_upper_percentile)}}bootstrap percentile CI upper bound (paper Alg 3){p_end}
 {synopt:{cmd:e(mu)}}global intercept ({cmd:.} for twostep, scalar for joint){p_end}
 {synopt:{cmd:e(lambda_time)}}selected or fixed lambda_time{p_end}
 {synopt:{cmd:e(lambda_unit)}}selected or fixed lambda_unit{p_end}
 {synopt:{cmd:e(lambda_nn)}}selected or fixed lambda_nn{p_end}
 {synopt:{cmd:e(loocv_score)}}LOOCV objective Q(lambda_hat){p_end}
 {synopt:{cmd:e(loocv_n_valid)}}number of successful LOOCV fits{p_end}
-{synopt:{cmd:e(loocv_n_attempted)}}total LOOCV fit attempts{p_end}
-{synopt:{cmd:e(loocv_n_control_total)}}total control observations for LOOCV{p_end}
+{synopt:{cmd:e(loocv_n_attempted)}}total LOOCV fit attempts (= every D=0 cell, paper Eq. 5){p_end}
 {synopt:{cmd:e(loocv_fail_rate)}}LOOCV failure rate (0 to 1){p_end}
-{synopt:{cmd:e(loocv_subsampled)}}1 if LOOCV used subsampling, 0 otherwise{p_end}
 {synopt:{cmd:e(loocv_used)}}1 if LOOCV was performed, 0 if skipped{p_end}
-{synopt:{cmd:e(loocv_first_failed_t)}}first failed observation time (-1 if none){p_end}
-{synopt:{cmd:e(loocv_first_failed_i)}}first failed observation unit (-1 if none){p_end}
-{synopt:{cmd:e(max_loocv_samples)}}maximum LOOCV subsamples requested{p_end}
+{synopt:{cmd:e(loocv_first_failed_t)}}time index of the first LOOCV fit that failed (0-based; -1 if none){p_end}
+{synopt:{cmd:e(loocv_first_failed_i)}}unit index of the first LOOCV fit that failed (0-based; -1 if none){p_end}
 {synopt:{cmd:e(n_lambda_time)}}number of lambda_time grid values{p_end}
 {synopt:{cmd:e(n_lambda_unit)}}number of lambda_unit grid values{p_end}
 {synopt:{cmd:e(n_lambda_nn)}}number of lambda_nn grid values{p_end}
@@ -411,7 +489,10 @@ The {opt extended} grid covers all optimal values from Table 2 of the paper:
 {synopt:{cmd:e(alpha)}}unit fixed effects (N x 1){p_end}
 {synopt:{cmd:e(beta)}}time fixed effects (T x 1){p_end}
 {synopt:{cmd:e(factor_matrix)}}low-rank factor matrix L (T x N){p_end}
-{synopt:{cmd:e(tau)}}individual treatment effects (twostep only){p_end}
+{synopt:{cmd:e(tau)}}per-cell treatment effects (N_treated x 1); populated for both {cmd:twostep} and {cmd:joint}.  For {cmd:joint} the vector carries the single scalar tau replicated, so {cmd:mean(e(tau)) == e(att)} to machine precision in either method.{p_end}
+{synopt:{cmd:e(tau_matrix)}}treatment effects arranged as a T x N panel-shaped matrix with Stata missing (.) in untreated cells; omitted when the underlying panel metadata is unavailable.{p_end}
+{synopt:{cmd:e(converged_by_obs)}}convergence flag per treated cell (N_treated x 1; 1 = converged, 0 = hit {opt maxiter()}, -1 = solver error); {cmd:twostep} only.{p_end}
+{synopt:{cmd:e(n_iters_by_obs)}}iteration count per treated cell (N_treated x 1); {cmd:twostep} only.{p_end}
 {synopt:{cmd:e(theta)}}time weights (T x 1; twostep only){p_end}
 {synopt:{cmd:e(omega)}}unit weights (N x 1; twostep only){p_end}
 {synopt:{cmd:e(delta_time)}}global time weights (T x 1; joint only){p_end}
@@ -432,6 +513,7 @@ The {opt extended} grid covers all optimal values from Table 2 of the paper:
 {synopt:{cmd:e(panelvar)}}panel variable name{p_end}
 {synopt:{cmd:e(timevar)}}time variable name{p_end}
 {synopt:{cmd:e(grid_style)}}grid style used{p_end}
+{synopt:{cmd:e(joint_loocv)}}joint LOOCV strategy: {cmd:cycling} or {cmd:exhaustive}{p_end}
 {synopt:{cmd:e(treatment_pattern)}}treatment pattern detected{p_end}
 {synopt:{cmd:e(vcetype)}}"Bootstrap" (with bootstrap){p_end}
 {synopt:{cmd:e(estat_cmd)}}"trop_estat"{p_end}

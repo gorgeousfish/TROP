@@ -216,7 +216,6 @@ program define trop_handle_error
         di as txt "  2. Use custom grids with larger values:"
         di as txt "     {stata trop ..., lambda_nn_grid(0.1 1 10)}"
         di as txt "  3. Check data quality: {stata xtdescribe}"
-        di as txt "  4. Limit LOOCV samples: {stata trop ..., max_loocv_samples(50)}"
 
         c_local _stata_rc 498
         c_local _should_exit 1

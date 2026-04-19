@@ -21,17 +21,19 @@
 //! retained for testing but is not exposed via the C ABI.
 
 use ndarray::{Array2, ArrayView2};
-use rand::prelude::*;
-use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
 
+use crate::distance::UnitDistanceCache;
 use crate::estimation::{estimate_model, solve_joint_no_lowrank, solve_joint_with_lowrank};
-use crate::weights::{compute_joint_weights, compute_weight_matrix};
+use crate::weights::{compute_joint_weights, compute_weight_matrix_cached};
 
 /// Type alias for the LOOCV grid search result tuple.
 ///
 /// Fields: (best_lambda_time, best_lambda_unit, best_lambda_nn, best_score,
-///          n_valid, n_attempted, n_control_total, subsampled, first_failed_obs).
+///          n_valid, n_attempted, first_failed_obs).
+///
+/// `n_attempted` equals the total number of finite control observations
+/// because the LOOCV criterion (paper Eq. 5) sums over every D=0 cell.
 #[allow(clippy::type_complexity)]
 pub type LoocvGridSearchResult = (
     f64,
@@ -40,8 +42,6 @@ pub type LoocvGridSearchResult = (
     f64,
     usize,
     usize,
-    usize,
-    bool,
     Option<(usize, usize)>,
 );
 
@@ -51,27 +51,21 @@ type LoocvResultTuple = (f64, f64, f64, f64, usize, Option<(usize, usize)>);
 
 /// Collect control observations eligible for LOOCV evaluation.
 ///
-/// Returns all (period, unit) pairs where `control_mask` is nonzero and the
-/// outcome is finite.  When `max_samples > 0` and the number of eligible
-/// observations exceeds that limit, a deterministic Fisher–Yates subsample
-/// is drawn using the provided `seed`.  Setting `max_samples = 0` disables
-/// subsampling and returns every eligible observation.
+/// Returns every (period, unit) pair where `control_mask` is nonzero and the
+/// outcome is finite.  Per the LOOCV criterion (paper Eq. 5), Q(λ) is the
+/// sum of squared pseudo-treatment effects across **all** D=0 cells, so this
+/// function never subsamples.
 ///
 /// # Arguments
 /// * `y`            — Outcome matrix, n_periods × n_units.
 /// * `control_mask` — Nonzero entries mark control observations.
-/// * `max_samples`  — Upper bound on returned observations (0 = no limit).
-/// * `seed`         — RNG seed for reproducible subsampling.
 pub fn get_control_observations(
     y: &ArrayView2<f64>,
     control_mask: &ArrayView2<u8>,
-    max_samples: usize,
-    seed: u64,
 ) -> Vec<(usize, usize)> {
     let n_periods = y.nrows();
     let n_units = y.ncols();
 
-    // Collect all valid control observations.
     let mut obs: Vec<(usize, usize)> = Vec::new();
     for t in 0..n_periods {
         for i in 0..n_units {
@@ -79,14 +73,6 @@ pub fn get_control_observations(
                 obs.push((t, i));
             }
         }
-    }
-
-    // Subsample if the caller requested a cap.  max_samples == 0 means
-    // "use all control observations" (no subsampling).
-    if max_samples > 0 && obs.len() > max_samples {
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-        obs.shuffle(&mut rng);
-        obs.truncate(max_samples);
     }
 
     obs
@@ -109,6 +95,7 @@ pub fn loocv_score_for_params(
     d: &ArrayView2<f64>,
     control_mask: &ArrayView2<u8>,
     time_dist: &ArrayView2<i64>,
+    dist_cache: &UnitDistanceCache,
     control_obs: &[(usize, usize)],
     lambda_time: f64,
     lambda_unit: f64,
@@ -123,10 +110,13 @@ pub fn loocv_score_for_params(
     let mut n_valid = 0usize;
 
     for &(t, i) in control_obs {
-        // Compute observation-specific weight matrix.
-        let weight_matrix = compute_weight_matrix(
+        // Compute observation-specific weight matrix (using the cache so
+        // we avoid repeating the O(T) pairwise distance computation for
+        // every control observation).
+        let weight_matrix = compute_weight_matrix_cached(
             y,
             d,
+            dist_cache,
             n_periods,
             n_units,
             i,
@@ -168,6 +158,87 @@ pub fn loocv_score_for_params(
     }
 }
 
+/// Evaluate Q(λ) without short-circuiting on the first failure.
+///
+/// Mirrors [`loocv_score_for_params`] but keeps iterating through all
+/// control observations, recording every (t, i) for which `estimate_model`
+/// returns `None`.  Used by the public entry points for a single "final
+/// evaluation" pass at the LOOCV-selected λ so users can inspect the
+/// complete failure pattern rather than just the first failure.
+///
+/// The score follows the paper's convention: if any observation fails,
+/// Q = +∞ (selection should have already excluded such λ).  When all
+/// observations succeed, Q = Σ τ̂² (same as the short-circuiting path).
+///
+/// Returns `(score, n_valid, failed_obs)` where `failed_obs` is the full
+/// list of failing (period, unit) pairs in control-observation traversal
+/// order (sorted by (t, i)).
+#[allow(clippy::too_many_arguments)]
+pub fn loocv_score_for_params_full_diagnostic(
+    y: &ArrayView2<f64>,
+    d: &ArrayView2<f64>,
+    control_mask: &ArrayView2<u8>,
+    time_dist: &ArrayView2<i64>,
+    dist_cache: &UnitDistanceCache,
+    control_obs: &[(usize, usize)],
+    lambda_time: f64,
+    lambda_unit: f64,
+    lambda_nn: f64,
+    max_iter: usize,
+    tol: f64,
+) -> (f64, usize, Vec<(usize, usize)>) {
+    let n_periods = y.nrows();
+    let n_units = y.ncols();
+
+    let mut tau_sq_sum = 0.0;
+    let mut n_valid = 0usize;
+    let mut failed_obs: Vec<(usize, usize)> = Vec::new();
+
+    for &(t, i) in control_obs {
+        let weight_matrix = compute_weight_matrix_cached(
+            y,
+            d,
+            dist_cache,
+            n_periods,
+            n_units,
+            i,
+            t,
+            lambda_time,
+            lambda_unit,
+            time_dist,
+        );
+
+        match estimate_model(
+            y,
+            control_mask,
+            &weight_matrix.view(),
+            lambda_nn,
+            n_periods,
+            n_units,
+            max_iter,
+            tol,
+            Some((t, i)),
+        ) {
+            Some((alpha, beta, l, _n_iters, _converged)) => {
+                let tau = y[[t, i]] - alpha[i] - beta[t] - l[[t, i]];
+                tau_sq_sum += tau * tau;
+                n_valid += 1;
+            }
+            None => {
+                failed_obs.push((t, i));
+            }
+        }
+    }
+
+    let score = if !failed_obs.is_empty() || n_valid == 0 {
+        f64::INFINITY
+    } else {
+        tau_sq_sum
+    };
+
+    (score, n_valid, failed_obs)
+}
+
 /// Univariate LOOCV search over a single tuning parameter.
 ///
 /// Evaluates Q(λ) for each value in `grid` while holding the other two
@@ -187,6 +258,7 @@ pub fn univariate_loocv_search(
     d: &ArrayView2<f64>,
     control_mask: &ArrayView2<u8>,
     time_dist: &ArrayView2<i64>,
+    dist_cache: &UnitDistanceCache,
     control_obs: &[(usize, usize)],
     grid: &[f64],
     fixed_time: f64,
@@ -199,9 +271,23 @@ pub fn univariate_loocv_search(
     let mut best_score = f64::INFINITY;
     let mut best_value = grid.first().copied().unwrap_or(0.0);
 
-    // Convert fixed parameters that may be +∞ to effective finite values.
-    // λ_time/λ_unit = ∞ → 0.0 (uniform weights); λ_nn = ∞ → 1e10 (factor
-    // model disabled).  Grid values are always finite by construction.
+    // Effective fixed values for the held-constant parameters during the
+    // Stage-1 univariate search (paper footnote 2).
+    //
+    //   λ_time, λ_unit: MUST be finite.  The ADO/Mata layers reject `.`
+    //     (Stata missing / +∞) at the grid-construction stage because paper
+    //     Eq 3 defines the exponential kernels only on [0, ∞); λ = 0
+    //     already encodes the uniform-weight case.  A +∞ that reaches this
+    //     point indicates an internal bug.
+    //
+    //   λ_nn: MAY be +∞, which the paper (Eq 2 remark) recognizes as the
+    //     DID/TWFE special case (L ≡ 0).  We map it to the large-finite
+    //     sentinel 1e10 for the downstream estimator.
+    //
+    // We pass `f64::INFINITY` for λ_time/λ_unit internally in Stage 1 of
+    // `loocv_grid_search` to express "this axis is not yet under search";
+    // that sentinel is a calling convention, not a user-supplied value.
+    // It is mapped to 0.0 here to select the uniform kernel on that axis.
     let fixed_time_eff = if fixed_time.is_infinite() { 0.0 } else { fixed_time };
     let fixed_unit_eff = if fixed_unit.is_infinite() { 0.0 } else { fixed_unit };
     let fixed_nn_eff = if fixed_nn.is_infinite() { 1e10 } else { fixed_nn };
@@ -221,6 +307,7 @@ pub fn univariate_loocv_search(
                 d,
                 control_mask,
                 time_dist,
+                dist_cache,
                 control_obs,
                 lambda_time,
                 lambda_unit,
@@ -255,6 +342,7 @@ pub fn cycling_parameter_search(
     d: &ArrayView2<f64>,
     control_mask: &ArrayView2<u8>,
     time_dist: &ArrayView2<i64>,
+    dist_cache: &UnitDistanceCache,
     control_obs: &[(usize, usize)],
     lambda_time_grid: &[f64],
     lambda_unit_grid: &[f64],
@@ -278,6 +366,7 @@ pub fn cycling_parameter_search(
             d,
             control_mask,
             time_dist,
+            dist_cache,
             control_obs,
             lambda_unit_grid,
             lambda_time,
@@ -295,6 +384,7 @@ pub fn cycling_parameter_search(
             d,
             control_mask,
             time_dist,
+            dist_cache,
             control_obs,
             lambda_time_grid,
             0.0,
@@ -312,6 +402,7 @@ pub fn cycling_parameter_search(
             d,
             control_mask,
             time_dist,
+            dist_cache,
             control_obs,
             lambda_nn_grid,
             lambda_time,
@@ -343,7 +434,7 @@ pub fn cycling_parameter_search(
 ///
 /// # Returns
 /// `(best_λ_time, best_λ_unit, best_λ_nn, best_score, n_valid,
-///   n_attempted, n_control_total, subsampled, first_failed_obs)`
+///   n_attempted, first_failed_obs)`
 #[allow(clippy::too_many_arguments)]
 pub fn loocv_grid_search(
     y: &ArrayView2<f64>,
@@ -353,27 +444,16 @@ pub fn loocv_grid_search(
     lambda_time_grid: &[f64],
     lambda_unit_grid: &[f64],
     lambda_nn_grid: &[f64],
-    max_loocv_samples: usize,
     max_iter: usize,
     tol: f64,
-    seed: u64,
 ) -> LoocvGridSearchResult {
-    // Count total control observations before subsampling.
-    let n_periods = y.nrows();
-    let n_units = y.ncols();
-    let mut n_control_total = 0usize;
-    for t in 0..n_periods {
-        for i in 0..n_units {
-            if control_mask[[t, i]] != 0 && y[[t, i]].is_finite() {
-                n_control_total += 1;
-            }
-        }
-    }
-
-    // Get control observations for LOOCV (may be subsampled).
-    let control_obs = get_control_observations(y, control_mask, max_loocv_samples, seed);
+    // Per paper Eq. 5: Q(λ) sums over every D=0 cell.
+    let control_obs = get_control_observations(y, control_mask);
     let n_attempted = control_obs.len();
-    let subsampled = max_loocv_samples > 0 && n_control_total > max_loocv_samples;
+
+    // Build the pairwise distance cache once; it is reused across every
+    // grid point and every control observation within each LOOCV call.
+    let dist_cache = UnitDistanceCache::build(y, d);
 
     // Stage 1: Univariate searches for initial values.
     // λ_time search: fix λ_unit = 0, λ_nn = ∞.
@@ -382,6 +462,7 @@ pub fn loocv_grid_search(
         d,
         control_mask,
         time_dist,
+        &dist_cache,
         &control_obs,
         lambda_time_grid,
         0.0,
@@ -392,15 +473,26 @@ pub fn loocv_grid_search(
         tol,
     );
 
-    // λ_nn search: fix λ_time = ∞, λ_unit = 0.
+    // λ_nn search: fix λ_time = 0, λ_unit = 0.
+    //
+    // The Python reference (diff-diff==3.1.1, `_fit_local`, trop.py:663-673)
+    // initializes the nuclear-norm sweep with uniform time weights
+    // (λ_time = 0), *not* with the factor-model-off extremum (λ_time = ∞).
+    // Using λ_time = ∞ here masks the factor structure exactly when we are
+    // trying to pick λ_nn, biasing the Stage-1 initial point and — since the
+    // Stage-2 coordinate descent only polishes from that seed on a non-convex
+    // Q(λ) surface — producing a different local optimum than the paper's
+    // reference implementation.  See the project-root plan file for the
+    // derivation.
     let (lambda_nn_init, _) = univariate_loocv_search(
         y,
         d,
         control_mask,
         time_dist,
+        &dist_cache,
         &control_obs,
         lambda_nn_grid,
-        f64::INFINITY,
+        0.0,
         0.0,
         0.0,
         2,
@@ -414,6 +506,7 @@ pub fn loocv_grid_search(
         d,
         control_mask,
         time_dist,
+        &dist_cache,
         &control_obs,
         lambda_unit_grid,
         0.0,
@@ -430,6 +523,7 @@ pub fn loocv_grid_search(
         d,
         control_mask,
         time_dist,
+        &dist_cache,
         &control_obs,
         lambda_time_grid,
         lambda_unit_grid,
@@ -443,11 +537,20 @@ pub fn loocv_grid_search(
     );
 
     // Final evaluation at the selected parameters.
-    let (best_score, n_valid, first_failed) = loocv_score_for_params(
+    //
+    // Uses the full-diagnostic variant so that the exported `n_valid`
+    // counts every successful LOO fit (not "all successes up to the first
+    // failure").  When the selected λ produces no failures — the
+    // overwhelmingly common case — this is bit-identical to the
+    // short-circuit path; when it does produce failures, the diagnostic
+    // variant lets us report the first failure without under-counting
+    // the other successful observations.
+    let (best_score, n_valid, failed_obs) = loocv_score_for_params_full_diagnostic(
         y,
         d,
         control_mask,
         time_dist,
+        &dist_cache,
         &control_obs,
         best_time,
         best_unit,
@@ -456,6 +559,9 @@ pub fn loocv_grid_search(
         tol,
     );
 
+    // Preserve the historical "first failed observation" contract.
+    let first_failed = failed_obs.first().copied();
+
     (
         best_time,
         best_unit,
@@ -463,8 +569,6 @@ pub fn loocv_grid_search(
         best_score,
         n_valid,
         n_attempted,
-        n_control_total,
-        subsampled,
         first_failed,
     )
 }
@@ -553,7 +657,7 @@ pub fn loocv_score_joint(
 ///
 /// # Returns
 /// `(best_λ_time, best_λ_unit, best_λ_nn, best_score, n_valid,
-///   n_attempted, n_control_total, subsampled, first_failed_obs)`
+///   n_attempted, first_failed_obs)`
 #[allow(clippy::too_many_arguments)]
 pub fn loocv_grid_search_joint(
     y: &ArrayView2<f64>,
@@ -562,23 +666,11 @@ pub fn loocv_grid_search_joint(
     lambda_time_grid: &[f64],
     lambda_unit_grid: &[f64],
     lambda_nn_grid: &[f64],
-    max_loocv_samples: usize,
     max_iter: usize,
     tol: f64,
-    seed: u64,
 ) -> LoocvGridSearchResult {
     let n_periods = y.nrows();
     let n_units = y.ncols();
-
-    // Count total control observations before subsampling.
-    let mut n_control_total = 0usize;
-    for t in 0..n_periods {
-        for i in 0..n_units {
-            if control_mask[[t, i]] != 0 && y[[t, i]].is_finite() {
-                n_control_total += 1;
-            }
-        }
-    }
 
     // Determine the number of treated periods from D.
     let mut first_treat_period = n_periods;
@@ -592,10 +684,9 @@ pub fn loocv_grid_search_joint(
     }
     let treated_periods = n_periods.saturating_sub(first_treat_period);
 
-    // Get control observations for LOOCV (may be subsampled).
-    let control_obs = get_control_observations(y, control_mask, max_loocv_samples, seed);
+    // Per paper Eq. 5: Q(λ) sums over every D=0 cell.
+    let control_obs = get_control_observations(y, control_mask);
     let n_attempted = control_obs.len();
-    let subsampled = max_loocv_samples > 0 && n_control_total > max_loocv_samples;
 
     // Enumerate all grid combinations.
     let mut grid_combinations: Vec<(f64, f64, f64)> = Vec::new();
@@ -650,7 +741,6 @@ pub fn loocv_grid_search_joint(
 
     let (best_lt, best_lu, best_ln, best_score, n_valid, first_failed) = best_result;
 
-    // Story 4.5: Include n_control_total and subsampled flag for diagnostics
     (
         best_lt,
         best_lu,
@@ -658,8 +748,6 @@ pub fn loocv_grid_search_joint(
         best_score,
         n_valid,
         n_attempted,
-        n_control_total,
-        subsampled,
         first_failed,
     )
 }
@@ -681,24 +769,12 @@ pub fn loocv_cycling_search_joint(
     lambda_time_grid: &[f64],
     lambda_unit_grid: &[f64],
     lambda_nn_grid: &[f64],
-    max_loocv_samples: usize,
     max_iter: usize,
     tol: f64,
-    seed: u64,
     max_cycles: usize,
 ) -> LoocvGridSearchResult {
     let n_periods = y.nrows();
     let n_units = y.ncols();
-
-    // Count total control observations before subsampling
-    let mut n_control_total = 0usize;
-    for t in 0..n_periods {
-        for i in 0..n_units {
-            if control_mask[[t, i]] != 0 && y[[t, i]].is_finite() {
-                n_control_total += 1;
-            }
-        }
-    }
 
     // Determine treated periods from D matrix
     let mut first_treat_period = n_periods;
@@ -712,10 +788,9 @@ pub fn loocv_cycling_search_joint(
     }
     let treated_periods = n_periods.saturating_sub(first_treat_period);
 
-    // Get control observations for LOOCV (may be subsampled)
-    let control_obs = get_control_observations(y, control_mask, max_loocv_samples, seed);
+    // Per paper Eq. 5: Q(λ) sums over every D=0 cell.
+    let control_obs = get_control_observations(y, control_mask);
     let n_attempted = control_obs.len();
-    let subsampled = max_loocv_samples > 0 && n_control_total > max_loocv_samples;
 
     // Helper closure: univariate search over one parameter grid (parallelized)
     // param_idx: 0=lambda_time, 1=lambda_unit, 2=lambda_nn
@@ -834,8 +909,6 @@ pub fn loocv_cycling_search_joint(
         best_score,
         final_n_valid,
         n_attempted,
-        n_control_total,
-        subsampled,
         final_first_failed,
     )
 }
@@ -854,7 +927,7 @@ mod tests {
             [1, 0] // Unit 1 treated at period 2
         ];
 
-        let obs = get_control_observations(&y.view(), &control_mask.view(), 100, 42);
+        let obs = get_control_observations(&y.view(), &control_mask.view());
 
         // Should have 5 control observations (all except (2,1))
         assert_eq!(obs.len(), 5);
@@ -864,14 +937,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_control_observations_subsampling() {
+    fn test_get_control_observations_returns_all_finite_controls() {
+        // Per paper Eq. 5, every finite D=0 cell must enter Q(λ).
         let y = array![[1.0, 2.0, 3.0], [2.0, 3.0, 4.0], [3.0, 4.0, 5.0]];
         let control_mask = array![[1u8, 1, 1], [1, 1, 1], [1, 1, 1]];
 
-        // Request only 3 samples
-        let obs = get_control_observations(&y.view(), &control_mask.view(), 3, 42);
+        let obs = get_control_observations(&y.view(), &control_mask.view());
 
-        assert_eq!(obs.len(), 3);
+        assert_eq!(obs.len(), 9);
     }
 
     #[test]
@@ -973,8 +1046,6 @@ mod tests {
             best_score,
             n_valid,
             n_attempted,
-            n_control_total,
-            subsampled,
             _,
         ) = loocv_grid_search_joint(
             &y.view(),
@@ -983,10 +1054,8 @@ mod tests {
             lambda_time_grid,
             lambda_unit_grid,
             lambda_nn_grid,
-            1000, // max_loocv_samples
             100,
             1e-6,
-            42,
         );
 
         // Best parameters should be from the grid
@@ -1009,22 +1078,11 @@ mod tests {
         // n_attempted should equal number of control observations
         assert!(n_attempted > 0, "Should have attempted some observations");
         assert!(n_valid > 0, "Should have valid observations");
-
-        // Story 4.5: Verify diagnostic fields
-        assert!(
-            n_control_total >= n_attempted,
-            "n_control_total should be >= n_attempted"
-        );
-        assert!(
-            !subsampled,
-            "Should not subsample with max_loocv_samples=1000"
-        );
     }
 
     #[test]
-    fn test_loocv_joint_reproducibility() {
-        // Property 9: Subsampling reproducibility
-        // Same seed should produce identical results
+    fn test_loocv_joint_determinism() {
+        // Full LOOCV is fully deterministic: identical inputs ⇒ identical output.
         let y = array![
             [1.0, 2.0, 3.0],
             [2.0, 3.0, 4.0],
@@ -1043,7 +1101,6 @@ mod tests {
         let lambda_unit_grid = &[0.0];
         let lambda_nn_grid = &[1e10];
 
-        // Run twice with same seed
         let result1 = loocv_grid_search_joint(
             &y.view(),
             &d.view(),
@@ -1051,10 +1108,8 @@ mod tests {
             lambda_time_grid,
             lambda_unit_grid,
             lambda_nn_grid,
-            5, // Small sample for subsampling
             100,
             1e-6,
-            42, // Same seed
         );
 
         let result2 = loocv_grid_search_joint(
@@ -1064,13 +1119,10 @@ mod tests {
             lambda_time_grid,
             lambda_unit_grid,
             lambda_nn_grid,
-            5,
             100,
             1e-6,
-            42, // Same seed
         );
 
-        // Results should be identical
         assert_eq!(result1.0, result2.0, "λ_time should match");
         assert_eq!(result1.1, result2.1, "λ_unit should match");
         assert_eq!(result1.2, result2.2, "λ_nn should match");
@@ -1090,17 +1142,15 @@ mod tests {
         let lambda_unit_grid = &[0.0];
         let lambda_nn_grid = &[f64::INFINITY];
 
-        let (best_lt, _best_lu, best_ln, best_score, _, _, _, _, _) = loocv_grid_search_joint(
+        let (best_lt, _best_lu, best_ln, best_score, _, _, _) = loocv_grid_search_joint(
             &y.view(),
             &d.view(),
             &control_mask.view(),
             lambda_time_grid,
             lambda_unit_grid,
             lambda_nn_grid,
-            1000,
             100,
             1e-6,
-            42,
         );
 
         // Score should still be finite (infinity was converted internally)
@@ -1233,20 +1283,17 @@ mod tests {
         let lambda_unit_grid = &[0.0];
         let lambda_nn_grid = &[1e10];
 
-        let (_, _, _, best_score, n_valid, n_attempted, n_control_total, subsampled, _) =
-            loocv_grid_search(
-                &y.view(),
-                &d.view(),
-                &control_mask.view(),
-                &time_dist.view(),
-                lambda_time_grid,
-                lambda_unit_grid,
-                lambda_nn_grid,
-                1000, // No subsampling
-                100,
-                1e-6,
-                42,
-            );
+        let (_, _, _, best_score, n_valid, n_attempted, _) = loocv_grid_search(
+            &y.view(),
+            &d.view(),
+            &control_mask.view(),
+            &time_dist.view(),
+            lambda_time_grid,
+            lambda_unit_grid,
+            lambda_nn_grid,
+            100,
+            1e-6,
+        );
 
         // Verify diagnostic constraints
         assert!(
@@ -1259,25 +1306,15 @@ mod tests {
             n_valid,
             n_attempted
         );
-        assert!(
-            n_attempted <= n_control_total,
-            "n_attempted ({}) should be <= n_control_total ({})",
-            n_attempted,
-            n_control_total
-        );
-        assert!(
-            !subsampled,
-            "Should not subsample with max_loocv_samples=1000"
-        );
-        assert_eq!(
-            n_attempted, n_control_total,
-            "Without subsampling, n_attempted should equal n_control_total"
-        );
+        // Without subsampling, n_attempted equals the total control count.
+        assert_eq!(n_attempted, 11, "n_attempted should cover every D=0 cell");
     }
 
     #[test]
-    fn test_loocv_twostep_subsampling_diagnostics() {
-        // Test that subsampling correctly sets diagnostic flags
+    fn test_loocv_twostep_uses_all_control_observations() {
+        // Paper Eq. 5 requires Q(λ) to sum over every D=0 cell.
+        // n_attempted must equal the total finite control count, with no
+        // subsampling path available.
         let y = array![
             [1.0, 2.0, 3.0, 4.0, 5.0],
             [2.0, 3.0, 4.0, 5.0, 6.0],
@@ -1302,9 +1339,7 @@ mod tests {
         let lambda_unit_grid = &[0.0];
         let lambda_nn_grid = &[1e10];
 
-        // Total control observations = 19 (4*5 - 1 treated)
-        // Request only 5 samples
-        let (_, _, _, _, n_valid, n_attempted, n_control_total, subsampled, _) = loocv_grid_search(
+        let (_, _, _, _, n_valid, n_attempted, _) = loocv_grid_search(
             &y.view(),
             &d.view(),
             &control_mask.view(),
@@ -1312,19 +1347,11 @@ mod tests {
             lambda_time_grid,
             lambda_unit_grid,
             lambda_nn_grid,
-            5, // Force subsampling
             100,
             1e-6,
-            42,
         );
 
-        // Verify subsampling occurred
-        assert!(
-            subsampled,
-            "Should subsample when n_control > max_loocv_samples"
-        );
-        assert_eq!(n_attempted, 5, "n_attempted should equal max_loocv_samples");
-        assert_eq!(n_control_total, 19, "n_control_total should be 19");
+        assert_eq!(n_attempted, 19, "Must enumerate all D=0 cells");
         assert!(n_valid <= n_attempted, "n_valid should be <= n_attempted");
     }
 
@@ -1366,11 +1393,13 @@ mod tests {
         ];
 
         // Compute score twice
+        let dist_cache = UnitDistanceCache::build(&y.view(), &d.view());
         let (score1, n_valid1, _) = loocv_score_for_params(
             &y.view(),
             &d.view(),
             &control_mask.view(),
             &time_dist.view(),
+            &dist_cache,
             &control_obs,
             0.5, // lambda_time
             0.5, // lambda_unit
@@ -1384,6 +1413,7 @@ mod tests {
             &d.view(),
             &control_mask.view(),
             &time_dist.view(),
+            &dist_cache,
             &control_obs,
             0.5,
             0.5,
@@ -1425,12 +1455,14 @@ mod tests {
             (1.0, 1.0, 1.0),
         ];
 
+        let dist_cache = UnitDistanceCache::build(&y.view(), &d.view());
         for (lt, lu, ln) in test_params {
             let (score, n_valid, first_failed) = loocv_score_for_params(
                 &y.view(),
                 &d.view(),
                 &control_mask.view(),
                 &time_dist.view(),
+                &dist_cache,
                 &control_obs,
                 lt,
                 lu,
@@ -1466,6 +1498,48 @@ mod tests {
         }
     }
 
+    /// The diagnostic variant agrees with the short-circuit variant on
+    /// both score and n_valid when no observation fails.  When at least
+    /// one observation fails, the diagnostic variant still iterates
+    /// through every observation and the reported `failed_obs` contains
+    /// `first_failed` as its first entry.
+    #[test]
+    fn test_loocv_score_diagnostic_matches_short_circuit() {
+        let y = array![[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [4.0, 6.0]];
+        let d = array![[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 1.0]];
+        let control_mask = array![[1u8, 1], [1, 1], [1, 1], [1, 0]];
+        let time_dist = array![[0i64, 1, 2, 3], [1, 0, 1, 2], [2, 1, 0, 1], [3, 2, 1, 0]];
+        let control_obs: Vec<(usize, usize)> =
+            vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1), (3, 0)];
+
+        let dist_cache = UnitDistanceCache::build(&y.view(), &d.view());
+
+        // Healthy parameterisation — expect no failures and matching scores.
+        let (score_short, n_valid_short, first_failed_short) = loocv_score_for_params(
+            &y.view(),
+            &d.view(),
+            &control_mask.view(),
+            &time_dist.view(),
+            &dist_cache,
+            &control_obs,
+            0.5, 0.5, 0.1, 100, 1e-6,
+        );
+        let (score_full, n_valid_full, failed_full) = loocv_score_for_params_full_diagnostic(
+            &y.view(),
+            &d.view(),
+            &control_mask.view(),
+            &time_dist.view(),
+            &dist_cache,
+            &control_obs,
+            0.5, 0.5, 0.1, 100, 1e-6,
+        );
+
+        assert!(first_failed_short.is_none(), "expected zero failures at healthy λ");
+        assert!(failed_full.is_empty(), "diagnostic variant should report no failures");
+        assert_eq!(n_valid_short, n_valid_full);
+        assert!((score_short - score_full).abs() < 1e-12);
+    }
+
     #[test]
     fn test_loocv_parameter_selection_in_grid() {
         // Test that selected parameters are always from the provided grid
@@ -1488,7 +1562,7 @@ mod tests {
         let lambda_unit_grid = vec![0.0, 0.5, 1.0];
         let lambda_nn_grid = vec![0.0, 0.1, 1.0];
 
-        let (best_lt, best_lu, best_ln, _, _, _, _, _, _) = loocv_grid_search(
+        let (best_lt, best_lu, best_ln, _, _, _, _) = loocv_grid_search(
             &y.view(),
             &d.view(),
             &control_mask.view(),
@@ -1496,10 +1570,8 @@ mod tests {
             &lambda_time_grid,
             &lambda_unit_grid,
             &lambda_nn_grid,
-            1000,
             100,
             1e-6,
-            42,
         );
 
         assert!(

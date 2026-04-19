@@ -19,8 +19,9 @@
        trop_rust_available()          query plugin availability
 
   2. LOOCV interface
-       trop_loocv_twostep()           two-step LOOCV grid search
-       trop_loocv_joint()             joint LOOCV grid search
+       trop_loocv_twostep()             two-step LOOCV grid search
+       trop_loocv_joint()               joint LOOCV coordinate-descent search
+       trop_loocv_joint_exhaustive()    joint LOOCV Cartesian grid search
 
   3. Estimation interface
        trop_estimate_twostep()        two-step point estimation
@@ -301,7 +302,12 @@ real scalar trop_loocv_twostep()
 /*──────────────────────────────────────────────────────────────────────────────
   trop_loocv_joint()
 
-  Joint LOOCV grid search.
+  Joint LOOCV coordinate-descent search (default).
+
+  Two-stage strategy adapted from Footnote 2 of Athey et al. (2025):
+    Stage 1 — univariate sweeps with extreme fixed values;
+    Stage 2 — cyclic coordinate descent until convergence.
+  Complexity O(|grid| * max_cycles); favoured for large grids.
 
   Returns 0 on success.
 ──────────────────────────────────────────────────────────────────────────────*/
@@ -309,6 +315,23 @@ real scalar trop_loocv_twostep()
 real scalar trop_loocv_joint()
 {
     return(_trop_call_plugin("loocv_joint"))
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  trop_loocv_joint_exhaustive()
+
+  Joint LOOCV exhaustive (Cartesian) grid search.
+
+  Evaluates every (lambda_time, lambda_unit, lambda_nn) combination in
+  parallel; complexity is O(|Lambda_time| * |Lambda_unit| * |Lambda_nn|).
+  Matches the Python reference (diff_diff.trop_global, v3.1.1) exactly.
+
+  Returns 0 on success.
+──────────────────────────────────────────────────────────────────────────────*/
+
+real scalar trop_loocv_joint_exhaustive()
+{
+    return(_trop_call_plugin("loocv_joint_exhaustive"))
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -417,28 +440,22 @@ real scalar trop_compute_unit_distance()
   Collects LOOCV diagnostic scalars written by the plugin, derives the
   failure rate, and posts everything to e():
 
-    e(loocv_score)            optimal cross-validation score  Q(lambda_hat)
-    e(loocv_n_valid)          successful leave-one-out fits
-    e(loocv_n_attempted)      attempted leave-one-out fits
-    e(loocv_n_control_total)  total control observations
-    e(loocv_fail_rate)        fraction of failed fits
-    e(loocv_subsampled)       1 if subsampling was applied
-    e(max_loocv_samples)      subsampling cap
-    e(seed)                   RNG seed used for subsampling
+    e(loocv_score)        optimal cross-validation score  Q(lambda_hat)
+    e(loocv_n_valid)      successful leave-one-out fits
+    e(loocv_n_attempted)  attempted leave-one-out fits (=total D=0 cells)
+    e(loocv_fail_rate)    fraction of failed fits
+    e(seed)               RNG seed (used for bootstrap)
 
   Arguments
-    method              "twostep" or "joint"
-    max_loocv_samples   subsampling cap (0 = no cap)
-    seed                RNG seed
+    method  "twostep" or "joint"
+    seed    RNG seed (recorded only; LOOCV itself is deterministic)
 ──────────────────────────────────────────────────────────────────────────────*/
 
 void store_loocv_diagnostics(
     string scalar method,
-    real scalar max_loocv_samples,
     real scalar seed)
 {
-    real scalar loocv_score, n_valid, n_attempted, n_control_total
-    real scalar subsampled, fail_rate
+    real scalar loocv_score, n_valid, n_attempted, fail_rate
     real matrix temp
 
     temp = st_numscalar("__trop_loocv_score")
@@ -453,14 +470,6 @@ void store_loocv_diagnostics(
     if (rows(temp) > 0) n_attempted = temp
     else n_attempted = .
 
-    temp = st_numscalar("__trop_loocv_n_control_total")
-    if (rows(temp) > 0) n_control_total = temp
-    else n_control_total = .
-
-    temp = st_numscalar("__trop_loocv_subsampled")
-    if (rows(temp) > 0) subsampled = temp
-    else subsampled = 0
-
     if (n_attempted == . | n_attempted == 0) {
         fail_rate = .
     }
@@ -468,14 +477,11 @@ void store_loocv_diagnostics(
         fail_rate = (n_attempted - n_valid) / n_attempted
     }
 
-    st_numscalar("e(loocv_score)",           loocv_score)
-    st_numscalar("e(loocv_n_valid)",         n_valid)
-    st_numscalar("e(loocv_n_attempted)",     n_attempted)
-    st_numscalar("e(loocv_n_control_total)", n_control_total)
-    st_numscalar("e(loocv_fail_rate)",       fail_rate)
-    st_numscalar("e(loocv_subsampled)",      subsampled)
-    st_numscalar("e(max_loocv_samples)",     max_loocv_samples)
-    st_numscalar("e(seed)",                  seed)
+    st_numscalar("e(loocv_score)",       loocv_score)
+    st_numscalar("e(loocv_n_valid)",     n_valid)
+    st_numscalar("e(loocv_n_attempted)", n_attempted)
+    st_numscalar("e(loocv_fail_rate)",   fail_rate)
+    st_numscalar("e(seed)",              seed)
 }
 
 /*──────────────────────────────────────────────────────────────────────────────
@@ -491,20 +497,42 @@ void store_loocv_diagnostics(
 
 real scalar check_loocv_fail_rate()
 {
-    real scalar fail_rate
+    real scalar fail_rate, first_t, first_i
     real matrix temp
 
     temp = st_numscalar("e(loocv_fail_rate)")
     if (rows(temp) == 0) return(0)
     fail_rate = temp
 
+    first_t = .
+    first_i = .
+    temp = st_numscalar("e(loocv_first_failed_t)")
+    if (rows(temp) > 0) first_t = temp
+    temp = st_numscalar("e(loocv_first_failed_i)")
+    if (rows(temp) > 0) first_i = temp
+
     if (fail_rate > 0.50) {
         errprintf("LOOCV failure rate too high: %5.1f%%\n", fail_rate * 100)
         errprintf("results would be unreliable; check data quality\n")
+        if (first_t != . & first_i != . & first_t >= 0 & first_i >= 0) {
+            /* Rust indices are 0-based; display 1-based to match Stata. */
+            errprintf(
+                "first failing LOO fit: period %g, unit %g (1-based);\n",
+                first_t + 1, first_i + 1)
+            errprintf(
+                "  cross-reference e(panelvar), e(timevar), and the estimation sample\n")
+        }
         return(498)
     }
     if (fail_rate > 0.10) {
         printf("{txt}warning: LOOCV failure rate is %5.1f%%\n", fail_rate * 100)
+        if (first_t != . & first_i != . & first_t >= 0 & first_i >= 0) {
+            printf(
+                "{txt}  first failing LOO fit at period %g, unit %g (1-based);\n",
+                first_t + 1, first_i + 1)
+            printf(
+                "{txt}  see e(loocv_first_failed_t), e(loocv_first_failed_i)\n")
+        }
     }
 
     return(0)
@@ -514,18 +542,14 @@ real scalar check_loocv_fail_rate()
   display_loocv_verbose()
 
   Prints a one-line summary of LOOCV activity to the Results window:
-  number of control observations evaluated, whether subsampling was
-  applied, and the success/failure breakdown.
+  number of control observations evaluated and the success/failure
+  breakdown.  LOOCV always sums over every D=0 cell (paper Eq. 5).
 ──────────────────────────────────────────────────────────────────────────────*/
 
 void display_loocv_verbose()
 {
-    real scalar n_control, n_attempted, n_valid, subsampled, fail_pct
+    real scalar n_attempted, n_valid, fail_pct
     real matrix temp
-
-    temp = st_numscalar("e(loocv_n_control_total)")
-    if (rows(temp) > 0) n_control = temp
-    else n_control = .
 
     temp = st_numscalar("e(loocv_n_attempted)")
     if (rows(temp) > 0) n_attempted = temp
@@ -535,19 +559,9 @@ void display_loocv_verbose()
     if (rows(temp) > 0) n_valid = temp
     else n_valid = .
 
-    temp = st_numscalar("e(loocv_subsampled)")
-    if (rows(temp) > 0) subsampled = temp
-    else subsampled = 0
-
     if (n_attempted == . | n_attempted == 0) return
 
-    if (subsampled) {
-        printf("LOOCV: %g control obs evaluated (%g total, subsampled)\n",
-               n_attempted, n_control)
-    }
-    else {
-        printf("LOOCV: %g control obs evaluated\n", n_attempted)
-    }
+    printf("LOOCV: %g control obs evaluated\n", n_attempted)
 
     if (n_valid == .) n_valid = n_attempted
     fail_pct = (n_attempted - n_valid) / n_attempted * 100
@@ -589,6 +603,7 @@ real scalar _trop_main(
     real scalar rc
     real scalar lambda_time, lambda_unit, lambda_nn
     real scalar max_iter, tol, seed, alpha_level
+    string scalar joint_mode
 
     /* ── plugin check ────────────────────────────────────────────────── */
     if (!trop_rust_available()) {
@@ -598,8 +613,17 @@ real scalar _trop_main(
 
     /* ── LOOCV ───────────────────────────────────────────────────────── */
     if (do_loocv) {
-        if (method == "twostep") rc = trop_loocv_twostep()
-        else rc = trop_loocv_joint()
+        if (method == "twostep") {
+            rc = trop_loocv_twostep()
+        }
+        else {
+            /* joint: dispatch on __trop_joint_loocv_mode.
+               "exhaustive" -> full Cartesian search;
+               anything else (including missing) -> coordinate descent. */
+            joint_mode = st_global("__trop_joint_loocv_mode")
+            if (joint_mode == "exhaustive") rc = trop_loocv_joint_exhaustive()
+            else rc = trop_loocv_joint()
+        }
         if (rc != 0) return(rc)
     }
 

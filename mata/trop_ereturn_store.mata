@@ -156,7 +156,12 @@ void trop_store_results(string scalar method)
 
     /* ── bootstrap diagnostics ───────────────────────────────────────── */
     n_bootstrap_valid = _trop_safe_read_scalar("__trop_n_bootstrap_valid")
+    /* stata_bridge.c writes __trop_level = 1 - alpha (e.g. 0.95).  Convert
+       to Stata-convention percent form for e(level) (e.g. 95). */
     level = _trop_safe_read_scalar("__trop_level")
+    if (level < . & level > 0 & level < 1) {
+        level = level * 100
+    }
 
     /* Percentile CI from the bootstrap distribution (diagnostic only).
        The authoritative CI uses the t-distribution (or normal fallback).
@@ -281,6 +286,17 @@ void trop_store_results(string scalar method)
             st_numscalar("e(N_treated_obs)", n_treated)
         }
 
+        /* Per-observation convergence diagnostics.  When every entry is ≥ 0,
+           the plugin populated the matrix; skip on pre-allocation (−1). */
+        temp_mat = st_matrix("__trop_converged_by_obs")
+        if (rows(temp_mat) > 0 && min(temp_mat) > -0.5) {
+            st_matrix("e(converged_by_obs)", temp_mat)
+        }
+        temp_mat = st_matrix("__trop_n_iters_by_obs")
+        if (rows(temp_mat) > 0 && min(temp_mat) > -0.5) {
+            st_matrix("e(n_iters_by_obs)", temp_mat)
+        }
+
         /* Time weights theta (T x 1) and unit weights omega (N x 1) */
         temp_mat = st_matrix("__trop_theta")
         if (rows(temp_mat) > 0 && any(temp_mat)) {
@@ -300,6 +316,15 @@ void trop_store_results(string scalar method)
         st_numscalar("e(N_treated)", n_treated)
         st_numscalar("e(N_treated_obs)", n_treated)
 
+        /* Individual treatment effect vector tau_{i,t} per Eq 13.  The joint
+           method extracts τ post-hoc: τ_{it} = Y_{it} − μ − α_i − β_t − L_{it}
+           for each treated cell.  ATT = mean(τ) by Eq 1. */
+        temp_mat = st_matrix("__trop_tau")
+        if (rows(temp_mat) > 0) {
+            tau = temp_mat
+            st_matrix("e(tau)", tau)
+        }
+
         /* Time weights delta_time (T x 1) and unit weights delta_unit (N x 1) */
         temp_mat = st_matrix("__trop_delta_time")
         if (rows(temp_mat) > 0 && any(temp_mat)) {
@@ -310,6 +335,14 @@ void trop_store_results(string scalar method)
             st_matrix("e(delta_unit)", temp_mat)
         }
     }
+
+    /* ── (time x unit) treatment-effect matrix ───────────────────────
+       e(tau) is a vector of length N_treated (time-major).  Build a
+       T x N matrix with tau_{it} in its (t, i) cell and missing values
+       elsewhere, so that consumers can locate effects by (time, panel)
+       without reconstructing the ordering.  This is the Stata analogue
+       of Python's `TROPResults.treatment_effects` dict. */
+    _trop_build_tau_matrix(n_periods, n_units)
 
     /* ── diagnostic warnings ─────────────────────────────────────────── */
     _trop_display_warnings(loocv_n_valid, loocv_n_attempted,
@@ -387,12 +420,71 @@ void _trop_display_warnings(
     if (converged == 0) {
         if (method == "twostep") {
             printf("{res}Warning: Not all treated observations converged (max iterations=%g){txt}\n", n_iterations)
+            _trop_display_unconverged_obs(n_iterations)
         }
         else {
             printf("{res}Warning: Estimation did not converge (iterations=%g){txt}\n", n_iterations)
         }
         printf("{res}         Results may be unreliable.{txt}\n")
     }
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  _trop_display_unconverged_obs()
+
+  List the first few unconverged (t, i) cells using the per-obs diagnostics
+  that the twostep plugin emits.  Helps the user target maxiter() bumps or
+  inspect specific panel cells after a non-convergence warning.
+
+  The indices are 1-based Stata-style panel-unit / time-period positions
+  derived from the ordering in which the plugin enumerated treated cells
+  (for t in 1..T { for i in 1..N { if D[t,i]=1 ... } }).  To recover the
+  original panel IDs, the user can cross-reference e(panelvar) and
+  e(timevar) with the estimation sample.
+──────────────────────────────────────────────────────────────────────────────*/
+
+void _trop_display_unconverged_obs(real scalar n_iterations)
+{
+    real colvector converged_vec
+    real matrix    tau_mat
+    real scalar    k, n_tot, n_unconv, n_to_show, shown
+
+    tau_mat = st_matrix("__trop_tau")
+    converged_vec = st_matrix("__trop_converged_by_obs")
+    if (rows(converged_vec) == 0) return
+
+    n_tot = rows(converged_vec)
+    n_unconv = 0
+    for (k = 1; k <= n_tot; k++) {
+        if (converged_vec[k] == 0) n_unconv++
+    }
+    if (n_unconv == 0) return
+
+    printf("{res}         %g of %g treated cells reached maxiter=%g without converging.{txt}\n",
+           n_unconv, n_tot, n_iterations)
+
+    n_to_show = min((n_unconv, 5))
+    if (n_to_show < n_unconv) {
+        printf("{res}         First %g unconverged cells (tau reported; index = row in e(tau)):{txt}\n",
+               n_to_show)
+    }
+    else {
+        printf("{res}         Unconverged cells (tau reported; index = row in e(tau)):{txt}\n")
+    }
+    shown = 0
+    for (k = 1; k <= n_tot & shown < n_to_show; k++) {
+        if (converged_vec[k] == 0) {
+            if (rows(tau_mat) >= k) {
+                printf("{res}           #%g: tau = %12.6f{txt}\n", k, tau_mat[k, 1])
+            }
+            else {
+                printf("{res}           #%g{txt}\n", k)
+            }
+            shown++
+        }
+    }
+    printf("{res}         See e(converged_by_obs) and e(n_iters_by_obs) for the full pattern.{txt}\n")
+    printf("{res}         Consider increasing maxiter() (default 100) or adjusting lambda_nn.{txt}\n")
 }
 
 /*──────────────────────────────────────────────────────────────────────────────
@@ -567,6 +659,107 @@ void _trop_store_lambda_grids(
 
     st_matrix("e(lambda_grid)", lambda_grid)
     st_matrix("e(cv_curve)", cv_curve)
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  _trop_build_tau_matrix()
+
+  Assemble a T x N matrix of treatment effects, mirroring the structure of
+  the panel.  Non-treated cells are filled with Stata missing (.).
+
+  Inputs
+    - global __trop_touse_var       touse (estimation-sample marker)
+    - global __trop_treatvar        treatment indicator W_{it}
+    - global __trop_panel_idx_var   consecutive panel index 1..N
+    - global __trop_time_idx_var    consecutive time index 1..T
+    - stata matrix __trop_tau       N_treated x 1 (time-major)
+
+  Arguments
+    T   number of time periods
+    N   number of panel units
+
+  Output
+    e(tau_matrix)   T x N real matrix; tau_{t,i} for treated cells, missing
+                    elsewhere; empty when required inputs are missing.
+──────────────────────────────────────────────────────────────────────────────*/
+
+void _trop_build_tau_matrix(real scalar T, real scalar N)
+{
+    string scalar touse_var, treatvar, panel_var, time_var
+    real matrix  tau_vec, obs_data, treated_info, tau_matrix
+    real scalar  n_obs, k, n_treated_obs, n_filled, tau_k, row_t, col_i
+
+    /* Plugin may not populate __trop_tau under every failure mode. */
+    tau_vec = st_matrix("__trop_tau")
+    if (rows(tau_vec) == 0) {
+        return
+    }
+    n_treated_obs = rows(tau_vec)
+
+    /* Require complete index metadata.  Silently skip when any piece is
+       missing; keep e(tau) available so consumers still have access. */
+    touse_var = st_global("__trop_touse_var")
+    treatvar  = st_global("__trop_treatvar")
+    panel_var = st_global("__trop_panel_idx_var")
+    time_var  = st_global("__trop_time_idx_var")
+    if (touse_var == "" || treatvar == "" ||
+        panel_var == "" || time_var == "") {
+        return
+    }
+    if (T <= 0 || T >= . || N <= 0 || N >= .) {
+        return
+    }
+    /* Guard against tempvars that may have been dropped (e.g. when the
+       touse variable was consumed by `ereturn post ... esample(var)`).
+       If any key variable is missing from the dataset we cannot rebuild
+       the (t, i) coordinates, so we bail out silently. */
+    if (_st_varindex(touse_var) == . || _st_varindex(treatvar) == . ||
+        _st_varindex(panel_var) == . || _st_varindex(time_var) == .) {
+        return
+    }
+
+    /* Read (time, panel, treat) triplets for the estimation sample. */
+    obs_data = st_data(., (time_var, panel_var, treatvar), touse_var)
+    n_obs = rows(obs_data)
+    if (n_obs == 0) {
+        return
+    }
+
+    /* Keep only treated rows, then sort by (time, panel) to match the
+       time-major ordering of tau_vec produced by the Rust backend. */
+    treated_info = select(obs_data, obs_data[., 3] :!= 0)
+    if (rows(treated_info) == 0) {
+        return
+    }
+    if (rows(treated_info) != n_treated_obs) {
+        /* Ordering mismatch is recoverable only when counts align.
+           Log once (as a note) and fall back to leaving e(tau_matrix)
+           unset so consumers detect the absence rather than reading
+           silently mis-aligned values. */
+        printf("{txt}(note: treated-cell count %g != e(tau) length %g; skipping e(tau_matrix) construction){txt}\n",
+               rows(treated_info), n_treated_obs)
+        return
+    }
+    treated_info = sort(treated_info, (1, 2))
+
+    /* Fill the T x N grid. */
+    tau_matrix = J(T, N, .)
+    n_filled = 0
+    for (k = 1; k <= n_treated_obs; k++) {
+        row_t = treated_info[k, 1]
+        col_i = treated_info[k, 2]
+        if (row_t >= 1 && row_t <= T && col_i >= 1 && col_i <= N) {
+            tau_k = tau_vec[k, 1]
+            if (tau_k < .) {
+                tau_matrix[row_t, col_i] = tau_k
+                n_filled++
+            }
+        }
+    }
+
+    if (n_filled > 0) {
+        st_matrix("e(tau_matrix)", tau_matrix)
+    }
 }
 
 end

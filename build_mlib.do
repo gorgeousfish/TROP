@@ -27,7 +27,7 @@ local base_dir ""
 
 // Try: current directory is trop_stata/
 if "`mata_dir'" == "" {
-    capture confirm file "mata/trop_structures.mata"
+    capture confirm file "mata/trop_constants.mata"
     if _rc == 0 {
         local mata_dir "mata"
         local base_dir "."
@@ -36,7 +36,7 @@ if "`mata_dir'" == "" {
 
 // Fallback: Try current directory is project root
 if "`mata_dir'" == "" {
-    capture confirm file "trop_stata/mata/trop_structures.mata"
+    capture confirm file "trop_stata/mata/trop_constants.mata"
     if _rc == 0 {
         local mata_dir "trop_stata/mata"
         local base_dir "trop_stata"
@@ -45,7 +45,7 @@ if "`mata_dir'" == "" {
 
 // Fallback: Try current directory is trop_stata/mata/
 if "`mata_dir'" == "" {
-    capture confirm file "trop_structures.mata"
+    capture confirm file "trop_constants.mata"
     if _rc == 0 {
         local mata_dir "."
         local base_dir ".."
@@ -72,20 +72,19 @@ display as text ""
 // ============================================================
 // This matches the order in load_mata_once.do and compile_all.do
 
+// File list must match load_mata_once.do / compile_all.do exactly.
 local mata_files ///
-    "trop_structures.mata" ///
     "trop_constants.mata" ///
-    "trop_data_transfer.mata" ///
-    "trop_backend_select.mata" ///
     "trop_rust_interface.mata" ///
+    "trop_data_transfer.mata" ///
+    "trop_lambda_grid.mata" ///
+    "trop_backend_select.mata" ///
     "trop_ereturn_store.mata" ///
-    "trop_storage.mata" ///
     "trop_validation.mata" ///
-    "trop_mode_validate.mata" ///
     "trop_loocv_validation.mata" ///
     "trop_bootstrap_diagnostics.mata" ///
     "trop_estat_helpers.mata" ///
-    "trop_lambda_grid.mata" ///
+    "trop_estimator_core.mata" ///
     "trop_main.mata"
 
 local error_count = 0

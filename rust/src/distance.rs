@@ -180,6 +180,148 @@ pub fn compute_unit_distance_for_obs(
     }
 }
 
+/// Precomputed pairwise statistics enabling O(1) `compute_unit_distance_for_obs`.
+///
+/// The per-observation distance in Equation (3),
+///
+/// ```text
+/// dist_{-t}(j, i) = sqrt( Σ_{u ≠ t} 1_{valid(u,i,j)} · (Y_{ui} − Y_{uj})²
+///                         / Σ_{u ≠ t} 1_{valid(u,i,j)} )
+/// ```
+///
+/// with `valid(u, i, j) = (D_{ui} = 0) ∧ (D_{uj} = 0) ∧ Y_{ui}, Y_{uj}
+/// finite`, can be factored as
+///
+/// ```text
+/// Numerator(t, i, j)   = Σ_{u}         · · · − I(valid(t,i,j)) · (Y_{ti} − Y_{tj})²
+/// Denominator(t, i, j) = Σ_{u}         · · · − I(valid(t,i,j))
+/// ```
+///
+/// i.e. "remove the contribution of period t from the unrestricted sum".
+/// This cache stores the unrestricted sums once for every (i, j) pair, so
+/// each subsequent query is a handful of scalar operations.
+///
+/// Accuracy: the cached distance matches the direct computation to
+/// round-off (|Δ| < 1e-10 in the bundled proptests); for small n_valid
+/// minor differences in floating-point summation order are possible but
+/// do not affect the exponential weight `exp(−λ · dist)` in any relevant
+/// way.
+#[derive(Clone, Debug)]
+pub struct UnitDistanceCache {
+    /// `sum_sq[i * n_units + j]` = Σ_u I(valid) · (Y_{ui} − Y_{uj})²
+    sum_sq: Vec<f64>,
+    /// `count[i * n_units + j]` = Σ_u I(valid)  (as f64 for fast division)
+    count: Vec<f64>,
+    n_units: usize,
+    n_periods: usize,
+    /// Per-period validity mask, column-major: `valid[t + i * n_periods]`.
+    /// True when both `D[t, i] = 0` and `Y[t, i]` finite.
+    unit_valid: Vec<bool>,
+}
+
+impl UnitDistanceCache {
+    /// Build the cache from the full panel.
+    ///
+    /// Cost is O(N² · T) arithmetic; memory is O(N² + N · T).
+    pub fn build(y: &ArrayView2<f64>, d: &ArrayView2<f64>) -> Self {
+        let n_periods = y.nrows();
+        let n_units = y.ncols();
+
+        // Per-unit validity mask: cell (t, i) is usable iff control & finite.
+        let mut unit_valid = vec![false; n_periods * n_units];
+        for i in 0..n_units {
+            for t in 0..n_periods {
+                unit_valid[t + i * n_periods] =
+                    d[[t, i]] == 0.0 && y[[t, i]].is_finite();
+            }
+        }
+
+        // Accumulate the unrestricted pairwise sums (no 1{u ≠ t} exclusion).
+        // Only the upper triangle is computed; the lower triangle is
+        // mirrored to preserve symmetry of the stored distance.
+        let mut sum_sq = vec![0.0_f64; n_units * n_units];
+        let mut count = vec![0.0_f64; n_units * n_units];
+        for i in 0..n_units {
+            for j in i..n_units {
+                let mut s = 0.0_f64;
+                let mut c = 0.0_f64;
+                for t in 0..n_periods {
+                    if unit_valid[t + i * n_periods] && unit_valid[t + j * n_periods] {
+                        let diff = y[[t, i]] - y[[t, j]];
+                        s += diff * diff;
+                        c += 1.0;
+                    }
+                }
+                sum_sq[i * n_units + j] = s;
+                count[i * n_units + j] = c;
+                if i != j {
+                    sum_sq[j * n_units + i] = s;
+                    count[j * n_units + i] = c;
+                }
+            }
+        }
+
+        UnitDistanceCache {
+            sum_sq,
+            count,
+            n_units,
+            n_periods,
+            unit_valid,
+        }
+    }
+
+    /// Query the exact Eq. (3) distance dist_{−t}(j, i) in O(1).
+    ///
+    /// Returns `f64::INFINITY` when no valid control period (excluding the
+    /// target) is available for the pair — matching the direct
+    /// implementation in `compute_unit_distance_for_obs`.
+    #[inline]
+    pub fn distance(
+        &self,
+        y: &ArrayView2<f64>,
+        j: usize,
+        i: usize,
+        target_period: usize,
+    ) -> f64 {
+        debug_assert!(j < self.n_units && i < self.n_units);
+        debug_assert!(target_period < self.n_periods);
+
+        let idx = i * self.n_units + j;
+        let mut s = self.sum_sq[idx];
+        let mut c = self.count[idx];
+
+        let i_valid = self.unit_valid[target_period + i * self.n_periods];
+        let j_valid = self.unit_valid[target_period + j * self.n_periods];
+        if i_valid && j_valid {
+            // Remove the target period's contribution.
+            let diff = y[[target_period, i]] - y[[target_period, j]];
+            s -= diff * diff;
+            c -= 1.0;
+
+            // Floor at zero to absorb catastrophic cancellation when the
+            // subtracted contribution is numerically equal to the total.
+            if s < 0.0 {
+                s = 0.0;
+            }
+        }
+
+        if c > 0.0 {
+            (s / c).sqrt()
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Returns `true` iff `(target_period, unit)` is in the control state
+    /// with a finite outcome.  Convenience accessor for the weights layer,
+    /// which needs the same flag when deciding whether a unit participates
+    /// in the kernel at a given period.
+    #[inline]
+    pub fn unit_is_control_at(&self, target_period: usize, unit: usize) -> bool {
+        self.unit_valid[target_period + unit * self.n_periods]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +484,110 @@ mod tests {
         // Exclude period 1: only period 0 remains.
         let dist_ex1 = compute_unit_distance_for_obs(&y.view(), &d.view(), 0, 1, 1);
         assert!((dist_ex1 - 0.5).abs() < 1e-10);
+    }
+
+    /// UnitDistanceCache produces the same distance as the direct computation
+    /// for every (target_period, i, j) triple on a fixed reference panel.
+    #[test]
+    fn test_unit_distance_cache_matches_direct() {
+        let y = array![
+            [0.496714153011233,  0.361735698828815,  1.647688538100692,  3.023029856408026],
+            [-0.234153374723336, 0.265863043050819,  2.579212815507391,  2.267434729152909],
+            [-0.469474385934952, 1.042560043585965,  0.536582307187538,  1.034270246429743],
+            [0.241962271566034, -1.413280244657798, -0.724917832513033,  0.937712470759027],
+            [-1.012831120334424, 0.814247332595274,  0.091975924478789,  0.087696298664708]
+        ];
+        let d = array![
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0]
+        ];
+
+        let cache = UnitDistanceCache::build(&y.view(), &d.view());
+
+        for target_period in 0..5 {
+            for i in 0..4 {
+                for j in 0..4 {
+                    let direct = compute_unit_distance_for_obs(
+                        &y.view(),
+                        &d.view(),
+                        j,
+                        i,
+                        target_period,
+                    );
+                    let cached = cache.distance(&y.view(), j, i, target_period);
+                    if direct.is_infinite() {
+                        assert!(
+                            cached.is_infinite(),
+                            "Cached distance at (t={}, i={}, j={}) should be inf, got {}",
+                            target_period, i, j, cached
+                        );
+                    } else {
+                        assert!(
+                            (direct - cached).abs() < 1e-10,
+                            "Cached distance mismatch at (t={}, i={}, j={}): direct={}, cached={}, diff={}",
+                            target_period, i, j, direct, cached, (direct - cached).abs()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cache respects the `d == 1` mask: treated cells are excluded from
+    /// the pairwise sum regardless of target period.
+    #[test]
+    fn test_unit_distance_cache_respects_treatment_mask() {
+        // Units 0, 1 always control; unit 2 treated from period 2 onward.
+        let y = array![[1.0, 1.5, 0.0], [2.0, 2.5, 0.0], [3.0, 3.5, 0.0], [4.0, 4.5, 0.0]];
+        let d = array![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0]
+        ];
+
+        let cache = UnitDistanceCache::build(&y.view(), &d.view());
+
+        // Pairs (0, 1) use every period. Difference is constant 0.5 ⇒ RMSE 0.5.
+        for t in 0..4 {
+            let direct = compute_unit_distance_for_obs(&y.view(), &d.view(), 0, 1, t);
+            let cached = cache.distance(&y.view(), 0, 1, t);
+            assert!((direct - cached).abs() < 1e-10);
+            assert!((direct - 0.5).abs() < 1e-10);
+        }
+
+        // Pair (0, 2) uses only periods 0, 1 (periods 2, 3 have unit 2
+        // treated).  Excluding period 0 leaves only period 1 ⇒ finite.
+        let direct_ex0 = compute_unit_distance_for_obs(&y.view(), &d.view(), 0, 2, 0);
+        let cached_ex0 = cache.distance(&y.view(), 0, 2, 0);
+        assert!((direct_ex0 - cached_ex0).abs() < 1e-10);
+    }
+
+    /// Catastrophic cancellation guard: removing the sole valid period's
+    /// contribution must not yield a negative sum_sq (which would produce NaN).
+    #[test]
+    fn test_unit_distance_cache_sole_valid_period() {
+        // Units 0, 1 both finite only at t = 2.
+        let y = array![
+            [f64::NAN, f64::NAN],
+            [f64::NAN, f64::NAN],
+            [1.0, 2.0],
+            [f64::NAN, f64::NAN]
+        ];
+        let d = array![[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]];
+
+        let cache = UnitDistanceCache::build(&y.view(), &d.view());
+
+        // Excluding t=2 leaves no valid periods → infinity
+        let cached_ex2 = cache.distance(&y.view(), 0, 1, 2);
+        assert!(cached_ex2.is_infinite());
+
+        // Sanity: at t=0 the only valid period (t=2) is retained
+        let cached_ex0 = cache.distance(&y.view(), 0, 1, 0);
+        assert!((cached_ex0 - 1.0).abs() < 1e-10);
     }
 }
 

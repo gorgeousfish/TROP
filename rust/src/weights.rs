@@ -15,7 +15,7 @@
 //!   observations, with time center at the midpoint of the treated block and
 //!   unit distance measured against the average treated trajectory.
 
-use crate::distance::compute_unit_distance_for_obs;
+use crate::distance::{compute_unit_distance_for_obs, UnitDistanceCache};
 use ndarray::{Array1, Array2, ArrayView2};
 
 /// Compute the per-observation weight matrix for the Twostep method.
@@ -64,6 +64,41 @@ pub fn compute_weight_matrix(
     );
 
     // W[s, j] = θ_s · ω_j
+    let mut weight_matrix = Array2::<f64>::zeros((n_periods, n_units));
+    for t in 0..n_periods {
+        for i in 0..n_units {
+            weight_matrix[[t, i]] = time_weights[t] * unit_weights[i];
+        }
+    }
+
+    weight_matrix
+}
+
+/// Cached twin of [`compute_weight_matrix`] that uses a pre-built
+/// [`UnitDistanceCache`] to short-circuit the per-call O(T) distance
+/// computation.
+///
+/// Produces numerically identical weights to the non-cached version (up to
+/// floating-point round-off from the `sum − (Y_t_i − Y_t_j)²` factoring).
+/// Prefer this entry point inside LOOCV / bootstrap hot loops.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_weight_matrix_cached(
+    y: &ArrayView2<f64>,
+    d: &ArrayView2<f64>,
+    cache: &UnitDistanceCache,
+    n_periods: usize,
+    n_units: usize,
+    target_unit: usize,
+    target_period: usize,
+    lambda_time: f64,
+    lambda_unit: f64,
+    time_dist: &ArrayView2<i64>,
+) -> Array2<f64> {
+    let (time_weights, unit_weights) = compute_twostep_weight_vectors_cached(
+        y, d, cache, n_periods, n_units, target_unit, target_period,
+        lambda_time, lambda_unit, time_dist,
+    );
+
     let mut weight_matrix = Array2::<f64>::zeros((n_periods, n_units));
     for t in 0..n_periods {
         for i in 0..n_units {
@@ -197,6 +232,52 @@ pub fn compute_twostep_weight_vectors(
     (time_weights, unit_weights)
 }
 
+/// Cached twin of [`compute_twostep_weight_vectors`].  See the non-cached
+/// version for the complete specification; this routine only replaces the
+/// per-pair O(T) distance computation by a cache lookup.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_twostep_weight_vectors_cached(
+    y: &ArrayView2<f64>,
+    d: &ArrayView2<f64>,
+    cache: &UnitDistanceCache,
+    n_periods: usize,
+    n_units: usize,
+    target_unit: usize,
+    target_period: usize,
+    lambda_time: f64,
+    lambda_unit: f64,
+    time_dist: &ArrayView2<i64>,
+) -> (Array1<f64>, Array1<f64>) {
+    // θ_s = exp(−λ_time · |t − s|), identical to the non-cached path.
+    let time_weights: Array1<f64> = Array1::from_shape_fn(n_periods, |s| {
+        let dist = time_dist[[target_period, s]] as f64;
+        (-lambda_time * dist).exp()
+    });
+
+    let mut unit_weights = Array1::<f64>::zeros(n_units);
+
+    if lambda_unit == 0.0 {
+        for j in 0..n_units {
+            if d[[target_period, j]] == 0.0 && j != target_unit {
+                unit_weights[j] = 1.0;
+            }
+        }
+    } else {
+        for j in 0..n_units {
+            if d[[target_period, j]] == 0.0 && j != target_unit {
+                let dist = cache.distance(y, j, target_unit, target_period);
+                if dist.is_finite() {
+                    unit_weights[j] = (-lambda_unit * dist).exp();
+                }
+            }
+        }
+    }
+
+    unit_weights[target_unit] = 1.0;
+
+    (time_weights, unit_weights)
+}
+
 /// Decompose Joint weights into separate time and unit vectors.
 ///
 /// Returns (δ_time, δ_unit) where:
@@ -287,7 +368,17 @@ pub fn compute_joint_weight_vectors(
                 (-lambda_unit * dist).exp()
             };
         } else {
-            // No pre-treatment periods; assign uniform weight.
+            // No pre-treatment periods (treated_periods >= n_periods).
+            //
+            // The Python reference (`diff_diff==3.1.1`, trop_global.py) raises
+            // ValueError at this point.  In the Stata pipeline such data is
+            // already rejected upstream: joint method requires non-staggered
+            // adoption, and panels with no pre-periods fail the minimum
+            // control-period overlap check (`_trop_chk_common_ctrl_periods`).
+            //
+            // This branch therefore only runs under direct FFI / unit-test
+            // usage.  We return uniform unit weights so the downstream code
+            // remains numerically well-defined rather than producing NaNs.
             delta_unit[i] = 1.0;
         }
     }
@@ -388,6 +479,34 @@ mod tests {
             .map(|(t, i)| weights[[t, i]])
             .sum();
         assert!(control_sum > 0.0, "Control weights should be positive");
+    }
+
+    #[test]
+    fn test_joint_weights_zero_pre_periods_returns_finite() {
+        // Regression guard for audit finding B-1: when treated_periods ==
+        // n_periods (no pre-period), the Python reference raises
+        // ValueError; trop_stata intentionally returns uniform unit weights
+        // so downstream code stays NaN-free.  This test pins the behaviour
+        // so a future refactor must deliberately change it.
+        let y = array![[1.0, 2.0], [2.0, 3.0]];
+        let d = array![[1.0, 1.0], [1.0, 1.0]];
+        let (delta_time, delta_unit) =
+            compute_joint_weight_vectors(&y.view(), &d.view(), 0.5, 0.5, 2);
+
+        assert_eq!(delta_unit.len(), 2);
+        for &w in delta_unit.iter() {
+            assert_eq!(w, 1.0, "n_pre == 0 must yield uniform unit weights");
+        }
+
+        for &t in delta_time.iter() {
+            assert!(t.is_finite(), "time weights must remain finite");
+        }
+
+        // Full matrix: all cells treated ⟹ δ · (1 − D) = 0 everywhere.
+        let weights = compute_joint_weights(&y.view(), &d.view(), 0.5, 0.5, 2);
+        for &w in weights.iter() {
+            assert_eq!(w, 0.0, "fully-treated panel must mask all cells to zero");
+        }
     }
 
     #[test]

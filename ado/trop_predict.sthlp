@@ -104,6 +104,12 @@ time periods.
 {bf:Joint:} Returns the homogeneous scalar ATT from {cmd:e(att)} for all
 treated observations.
 
+{pmore}
+The same information is available without creating a new variable through
+{cmd:e(tau_matrix)} (a {it:T x N} matrix indexed by (time, panel) with
+missing values in untreated cells); see {helpb trop##results:trop} for
+details.
+
 {phang}
 {opt residuals} calculates residuals for all observations.
 

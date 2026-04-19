@@ -316,13 +316,10 @@ program _trop_bs_repost_V, eclass
     local _n_pre_periods = e(n_pre_periods)
     local _n_post_periods = e(n_post_periods)
     local _loocv_used = e(loocv_used)
-    local _max_loocv_samples = e(max_loocv_samples)
     local _seed = e(seed)
     local _loocv_n_valid = e(loocv_n_valid)
     local _loocv_n_attempted = e(loocv_n_attempted)
-    local _loocv_n_control_total = e(loocv_n_control_total)
     local _loocv_fail_rate = e(loocv_fail_rate)
-    local _loocv_subsampled = e(loocv_subsampled)
     local _loocv_first_failed_t = e(loocv_first_failed_t)
     local _loocv_first_failed_i = e(loocv_first_failed_i)
     local _n_lambda_time = e(n_lambda_time)
@@ -387,9 +384,9 @@ program _trop_bs_repost_V, eclass
         data_validated min_pre_treated min_valid_pairs ///
         has_switching max_switches time_min time_max time_range ///
         n_pre_periods n_post_periods ///
-        loocv_used max_loocv_samples seed ///
-        loocv_n_valid loocv_n_attempted loocv_n_control_total ///
-        loocv_fail_rate loocv_subsampled ///
+        loocv_used seed ///
+        loocv_n_valid loocv_n_attempted ///
+        loocv_fail_rate ///
         loocv_first_failed_t loocv_first_failed_i ///
         n_lambda_time n_lambda_unit n_lambda_nn ///
         n_grid_combinations n_grid_per_cycle {
@@ -503,8 +500,11 @@ void _trop_run_post_bootstrap(
     // Set bootstrap-specific parameters
     trop_prepare_bootstrap(nreps, alpha, seed, lambda_time, lambda_unit, lambda_nn, max_iter, tol)
 
-    // Set algorithm options
-    trop_prepare_options(0, max_iter, tol, seed, nreps, alpha, verbose)
+    // Set algorithm options.  The signature is
+    //   trop_prepare_options(max_iter, tol, seed, nreps, alpha, verbose)
+    // The stray leading zero previously passed here caused a 7-argument
+    // dispatch that Mata rejected with r(3001).
+    trop_prepare_options(max_iter, tol, seed, nreps, alpha, verbose)
 
     if (verbose) {
         printf("{txt}Running %s bootstrap (%g replications)...\n", method, nreps)
@@ -530,7 +530,12 @@ void _trop_run_post_bootstrap(
     // Retrieve bootstrap outputs
     se = _trop_safe_read_scalar("__trop_se")
     n_bootstrap_valid = _trop_safe_read_scalar("__trop_n_bootstrap_valid")
+    // stata_bridge.c writes __trop_level = 1 - alpha in probability form
+    // (e.g. 0.95).  Normalize to the Stata percent convention (95).
     level = _trop_safe_read_scalar("__trop_level")
+    if (level < . && level > 0 && level < 1) {
+        level = level * 100
+    }
 
     // ------------------------------------------------------------------
     // Inference.

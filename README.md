@@ -166,7 +166,9 @@ Treatment Effect (ATT):
   tau     =     0.034188
 ```
 
-**Note:** LOOCV on N = 50, T = 40 typically takes 20–40 minutes. For faster evaluation use `fixedlambda()` or limit search with `max_loocv_samples(500)`.
+**Note:** LOOCV on N = 50, T = 40 sums over every D = 0 cell (paper Eq. 5)
+and can take 20–40 minutes. Use `fixedlambda()` when a full grid search is
+not needed.
 
 ### Example 3: Bootstrap Inference
 
@@ -415,16 +417,15 @@ Post-estimation (available after `trop`):
 
 | Option                       | Description                                                     | Default    |
 | ---------------------------- | --------------------------------------------------------------- | ---------- |
-| `method(string)`             | Estimation method: `twostep` or `joint`                         | `twostep`  |
+| `method(string)`             | Estimation method: `twostep` / `joint` (or aliases `local` / `global`) | `twostep`  |
 | `grid_style(string)`         | Lambda grid style: `default` or `extended`                      | `default`  |
 | `lambda_time_grid(numlist)`  | User-specified grid for lambda_time                             | auto       |
 | `lambda_unit_grid(numlist)`  | User-specified grid for lambda_unit                             | auto       |
 | `lambda_nn_grid(numlist)`    | User-specified grid for lambda_nn                               | auto       |
 | `fixedlambda(numlist)`       | Fix (lambda_time lambda_unit lambda_nn); skip LOOCV             | —          |
-| `max_loocv_samples(integer)` | LOOCV subsample size (0 = full sample)                          | `0`        |
 | `tol(real)`                  | Convergence tolerance for iterative estimation                  | `1e-6`     |
 | `maxiter(integer)`           | Maximum number of iterations                                    | `100`      |
-| `bootstrap(integer)`         | Number of bootstrap replications (0 = none)                     | `0`        |
+| `bootstrap(integer)`         | Number of bootstrap replications (0 = skip inference)           | `200`      |
 | `seed(integer)`              | Random number generator seed                                    | `42`       |
 | `level(cilevel)`             | Confidence level for intervals                                  | `c(level)` |
 | `verbose`                    | Display detailed diagnostic output                              | off        |
@@ -432,6 +433,14 @@ Post-estimation (available after `trop`):
 **Grid styles:**
 - `default` — 6 × 6 × 5 = 180 grid combinations, 17 evaluations per coordinate-descent cycle
 - `extended` — 14 × 16 × 18 = 4,032 combinations, 48 evaluations per cycle (finer search, slower)
+
+**Grid notes:**
+- `lambda_time_grid()` and `lambda_unit_grid()` must be finite, non-negative
+  numlists; Stata missing (`.`) is rejected at parse time.
+- `lambda_nn_grid()` and the third slot of `fixedlambda()` accept `.` as
+  +infinity, mirroring the `diff-diff 3.1.1` Python reference.  The default
+  grid includes this corner so LOOCV can select the "no factor structure"
+  regime (classical DID / synthetic control) when it minimises Q(λ).
 
 ### trop_bootstrap Options
 
@@ -497,11 +506,8 @@ Post-estimation (available after `trop`):
 | Scalar                     | Description                             |
 | -------------------------- | --------------------------------------- |
 | `e(loocv_n_valid)`         | Number of valid LOOCV evaluations       |
-| `e(loocv_n_attempted)`     | Number of attempted LOOCV evaluations   |
-| `e(loocv_n_control_total)` | Total control observations for LOOCV    |
+| `e(loocv_n_attempted)`     | Number of attempted LOOCV evaluations (= every D=0 cell, paper Eq. 5) |
 | `e(loocv_fail_rate)`       | LOOCV failure rate                      |
-| `e(loocv_subsampled)`      | Whether LOOCV subsampling was used (1/0)|
-| `e(max_loocv_samples)`     | LOOCV subsample size setting            |
 | `e(loocv_used)`            | Whether LOOCV was performed (1/0)       |
 | `e(seed)`                  | RNG seed used                           |
 
@@ -551,7 +557,10 @@ Post-estimation (available after `trop`):
 | `e(alpha)`               | Unit fixed effects (N×1)                             |
 | `e(beta)`                | Time fixed effects (T×1)                             |
 | `e(factor_matrix)`       | Low-rank factor matrix L (T×N)                       |
-| `e(tau)`                 | Individual treatment effects (twostep only)          |
+| `e(tau)`                 | Per-cell treatment effects (N_treated×1); populated for both methods. For `joint` the vector carries the scalar `tau` replicated, so `mean(e(tau)) == e(att)` holds to machine precision for either method. |
+| `e(tau_matrix)`          | Treatment effects arranged as a T×N panel-shaped matrix with `.` in untreated cells (when panel metadata is available) |
+| `e(converged_by_obs)`    | Convergence flag per treated cell (`1` converged, `0` hit `maxiter()`, `-1` solver error); twostep only |
+| `e(n_iters_by_obs)`      | Iteration count per treated cell; twostep only |
 | `e(bootstrap_estimates)` | Bootstrap distribution (B×1; requires bootstrap)     |
 | `e(theta)`               | Time weights (twostep only)                          |
 | `e(omega)`               | Unit weights (twostep only)                          |

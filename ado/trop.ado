@@ -13,10 +13,11 @@
     Syntax
     ------
     trop depvar treatvar [if] [in], panelvar(varname) timevar(varname)
-        [method(twostep|joint) grid_style(default|extended)
+        [method(twostep|joint|local|global) grid_style(default|extended)
+         joint_loocv(cycling|exhaustive)
          lambda_time_grid(numlist) lambda_unit_grid(numlist)
          lambda_nn_grid(numlist) fixedlambda(numlist)
-         max_loocv_samples(integer) tol(real) maxiter(integer)
+         tol(real) maxiter(integer)
          bootstrap(integer) bsalpha(real) seed(integer)
          verbose level(cilevel)]
 */
@@ -46,32 +47,71 @@ program define trop, eclass
         [                                   ///
         Method(string)                      /// "twostep" (per-obs tau) or "joint" (scalar tau)
         Grid_style(string)                  /// grid layout for LOOCV: "default" or "extended"
-        LAMbda_time_grid(numlist)           /// user-supplied lambda_time grid
-        LAMbda_unit_grid(numlist)           /// user-supplied lambda_unit grid
-        LAMbda_nn_grid(numlist)             /// user-supplied lambda_nn grid
-        FIXEDlambda(numlist)               /// fixed (lambda_time lambda_unit lambda_nn); skip LOOCV
-        Max_loocv_samples(integer 0)        /// subsample size for LOOCV (0 = full sample)
+        JOint_loocv(string)                 /// joint LOOCV strategy: "cycling" (default) or "exhaustive"
+        LAMbda_time_grid(numlist)                   /// user-supplied lambda_time grid
+        LAMbda_unit_grid(numlist)                   /// user-supplied lambda_unit grid
+        LAMbda_nn_grid(numlist missingokay)         /// user-supplied lambda_nn grid (`.` = inf)
+        FIXEDlambda(numlist missingokay min=3 max=3) /// fixed (l_time l_unit l_nn); `.` = inf for l_nn
         TOL(real 1e-6)                      /// convergence tolerance for iterative estimation
         MAXiter(integer 100)                /// maximum iterations for iterative estimation
-        BOOTstrap(integer 0)                /// number of bootstrap replications (0 = none)
+        BOOTstrap(integer 200)              /// number of bootstrap replications (paper Alg 3 default; 0 = skip)
         BSalpha(real -1)                    /// deprecated; retained for backward compatibility
-        SEED(integer 42)                    /// RNG seed for bootstrap and LOOCV subsampling
+        SEED(integer 42)                    /// RNG seed for bootstrap
         VERbose                             /// display progress and diagnostic messages
         Level(cilevel)                      /// confidence level for bootstrap CI
         ]
 
     // --- Variable extraction ----------------------------------------------
     gettoken depvar treatvar : varlist
+    // gettoken preserves the separating whitespace; strip it so downstream
+    // consumers (e(treatvar), Mata _st_varindex, etc.) see a clean name.
+    local treatvar = trim("`treatvar'")
 
     // --- Default values ---------------------------------------------------
     if "`method'" == "" {
         local method "twostep"
     }
+    // Accept paper terminology as aliases:
+    //   method("local")  == method("twostep")  (per-observation weights)
+    //   method("global") == method("joint")    (single scalar tau)
+    if "`method'" == "local" {
+        local method "twostep"
+    }
+    else if "`method'" == "global" {
+        local method "joint"
+    }
+    if !inlist("`method'", "twostep", "joint") {
+        di as error "method() must be {bf:twostep} (alias {bf:local}) or " ///
+            "{bf:joint} (alias {bf:global})"
+        exit 198
+    }
     if "`grid_style'" == "" {
         local grid_style "default"
     }
+    if "`joint_loocv'" == "" {
+        // Default to exhaustive Cartesian search to match diff-diff==3.1.1
+        // `_fit_global`, the numerical ground truth.  Users who need speed can
+        // opt into cycling coordinate descent via joint_loocv(cycling).
+        local joint_loocv "exhaustive"
+    }
     if "`level'" == "" {
         local level = c(level)
+    }
+
+    // --- Validate joint_loocv() -------------------------------------------
+    // Accept only "exhaustive" (Cartesian product, O(|grid|^3), matches
+    // Python diff-diff 3.1.1 `_fit_global`, default) or "cycling" (coordinate
+    // descent, O(|grid|*max_cycles), faster but may select a different lambda
+    // because the Q(lambda) surface is non-convex).  The option is parsed
+    // for any method() but only takes effect for method("joint") with LOOCV
+    // enabled.
+    if !inlist("`joint_loocv'", "cycling", "exhaustive") {
+        di as error "joint_loocv() must be either {bf:exhaustive} or {bf:cycling}"
+        di as error "  exhaustive (default): Cartesian product, O(|grid|^3),"
+        di as error "                        matches Python diff-diff 3.1.1"
+        di as error "  cycling             : coordinate descent, O(|grid|*cycles),"
+        di as error "                        faster but may select a different lambda"
+        exit 198
     }
 
     // bsalpha() is superseded by level().  When the sentinel value (-1)
@@ -179,7 +219,7 @@ program define trop, eclass
         lambda_nn_grid(`lambda_nn_grid') ///
         bootstrap(`bootstrap') bsalpha(`bsalpha') ///
         tol(`tol') maxiter(`maxiter') ///
-        max_loocv_samples(`max_loocv_samples') seed(`seed') ///
+        seed(`seed') ///
         touse(`touse')
 
     if "`verbose'" != "" {
@@ -339,14 +379,46 @@ program define trop, eclass
         local lambda_unit_val : word 2 of `fixedlambda'
         local lambda_nn_val : word 3 of `fixedlambda'
 
-        foreach lname in lambda_time_val lambda_unit_val lambda_nn_val {
+        // λ_time and λ_unit must be non-negative finite numbers.  Per paper
+        // Eq 3 the weights θ,ω are exp(−λ·dist); λ_time/λ_unit = ∞ would
+        // collapse all weight to the target period/unit only, which is
+        // degenerate and not a supported estimator configuration.
+        foreach lname in lambda_time_val lambda_unit_val {
+            // Detect the literal "." (Stata missing) before `confirm number`,
+            // which rejects "." even though numlist(missingokay) accepts it.
+            if "``lname''" == "." {
+                di as error "fixedlambda() does not accept `.' (missing / inf) for lambda_time or lambda_unit."
+                di as error "  Paper Eq 3: θ_s = exp(−lambda_time·|t−s|), ω_j = exp(−lambda_unit·dist)."
+                di as error "  lambda_time = lambda_unit = 0 recovers uniform weights; use finite values ≥ 0."
+                exit 198
+            }
             capture confirm number ``lname''
             if _rc {
                 di as error "fixedlambda() values must be numeric: found '``lname''"
                 exit 198
             }
-            if missing(``lname'') | ``lname'' < 0 {
-                di as error "fixedlambda() values must be non-negative numeric (missing values not allowed)"
+            if ``lname'' < 0 {
+                di as error "fixedlambda() values must be non-negative"
+                exit 198
+            }
+        }
+
+        // λ_nn = missing / inf is the DID/TWFE special case (L ≡ 0).
+        // Map to the large-finite sentinel 1e10 recognized by the C bridge.
+        if "`lambda_nn_val'" == "." {
+            local lambda_nn_val = 1e10
+            if "`verbose'" != "" {
+                di as txt "  lambda_nn = . (inf) → mapped to 1e10 (DID/TWFE special case: L ≡ 0)"
+            }
+        }
+        else {
+            capture confirm number `lambda_nn_val'
+            if _rc {
+                di as error "fixedlambda() values must be numeric: found '`lambda_nn_val''"
+                exit 198
+            }
+            if `lambda_nn_val' < 0 {
+                di as error "fixedlambda() lambda_nn must be non-negative (use . for +inf)"
                 exit 198
             }
         }
@@ -375,7 +447,10 @@ program define trop, eclass
             di as txt "  LOOCV: disabled (using fixed lambda)"
         }
         if `bootstrap' > 0 {
-            di as txt "  Bootstrap: `bootstrap' replications"
+            di as txt "  Bootstrap: `bootstrap' replications (paper Alg 3)"
+        }
+        else {
+            di as txt "  Bootstrap: skipped (user requested bootstrap(0))"
         }
     }
 
@@ -385,13 +460,28 @@ program define trop, eclass
     // The seed is forwarded to the plugin's internal RNG; Stata's global
     // RNG state is left unchanged.
 
+    // Transfer joint_loocv() mode to the Mata layer via a global macro.
+    // The Mata dispatcher _trop_main reads __trop_joint_loocv_mode and
+    // routes to either trop_loocv_joint() or trop_loocv_joint_exhaustive()
+    // when method == "joint" and LOOCV is enabled.
+    //
+    // The global is set via Mata's st_global() because Stata's `global`
+    // command rejects names with a leading underscore (r(198)), whereas
+    // Mata's st_global() accepts any identifier.
+    mata: st_global("__trop_joint_loocv_mode", "`joint_loocv'")
+
     // Dispatch to the compiled plugin through the Mata interface layer.
     // trop_main() returns 0 on success or a Stata return code on failure.
     mata: st_local("_trop_rc", strofreal(trop_main("`depvar'", "`treatvar'", "`panel_idx'", ///
         "`time_idx'", "`touse'", "`method'", ///
         `lambda_time_val', `lambda_unit_val', `lambda_nn_val', ///
         `run_cv', `bootstrap', `seed', `verbose_flag', ///
-        `maxiter', `tol', `bsalpha', `max_loocv_samples')))
+        `maxiter', `tol', `bsalpha')))
+
+    // Clear the global once the Mata call returns so that stale state does
+    // not leak into the next estimation.  Setting it to "" via st_global is
+    // equivalent to dropping it from the Mata perspective.
+    mata: st_global("__trop_joint_loocv_mode", "")
 
     // --- Post e(b) and e(V) ----------------------------------------------
     // ereturn post clears all prior e() contents, so it must precede the
@@ -419,16 +509,29 @@ program define trop, eclass
     tempname _b
     matrix `_b' = (`_att_val')
     matrix colnames `_b' = att
+    // `ereturn post … esample(var)` consumes `var` (it is dropped from the
+    // data and preserved only as e(sample)).  Downstream Mata code still
+    // needs to read the touse variable, so clone it into a fresh tempvar
+    // before posting.  The clone is dropped automatically at program exit.
+    tempvar _touse_esample
+    qui gen byte `_touse_esample' = `touse'
     if `_se_val' > 0 & !missing(`_se_val') {
         tempname _V
         matrix `_V' = (`_se_val' ^ 2)
         matrix colnames `_V' = att
         matrix rownames `_V' = att
-        ereturn post `_b' `_V', esample(`touse')
+        ereturn post `_b' `_V', esample(`_touse_esample')
     }
     else {
-        ereturn post `_b', esample(`touse')
+        ereturn post `_b', esample(`_touse_esample')
     }
+
+    // Expose the tempvar names so trop_store_results can build the
+    // (time x unit) tau matrix by re-reading treatment coordinates.
+    // Global macros are cleared automatically by trop_cleanup_temp_vars.
+    mata: st_global("__trop_treatvar", "`treatvar'")
+    mata: st_global("__trop_panel_idx_var", "`panel_idx'")
+    mata: st_global("__trop_time_idx_var", "`time_idx'")
 
     // Transfer remaining estimation results from plugin temporaries to e()
     mata: trop_store_results("`method'")
@@ -437,9 +540,9 @@ program define trop, eclass
     local _fatal_rc = 0
 
     // --- LOOCV diagnostics ------------------------------------------------
-    capture confirm scalar __trop_loocv_n_control_total
+    capture confirm scalar __trop_loocv_n_attempted
     if !_rc {
-        mata: store_loocv_diagnostics("`method'", `max_loocv_samples', `seed')
+        mata: store_loocv_diagnostics("`method'", `seed')
 
         if "`verbose'" != "" {
             mata: display_loocv_verbose()
@@ -476,6 +579,7 @@ program define trop, eclass
     // --- Store estimation metadata ----------------------------------------
     ereturn local method "`method'"
     ereturn local grid_style "`grid_style'"
+    ereturn local joint_loocv "`joint_loocv'"
     ereturn local cmd "trop"
     ereturn local estat_cmd "trop_estat"
     ereturn local cmdline "trop `0'"
@@ -497,7 +601,6 @@ program define trop, eclass
     }
 
     // LOOCV configuration scalars
-    ereturn scalar max_loocv_samples = `max_loocv_samples'
     ereturn scalar seed = `seed'
 
     // Lambda grid dimensions
@@ -573,6 +676,14 @@ program define trop, eclass
 
     di as txt "Method:" _col(20) as res "`method'"
     di as txt "Grid style:" _col(20) as res "`grid_style'" as txt " (`n_per_cycle' grid points/cycle, coordinate descent)"
+    if "`method'" == "joint" & `run_cv' {
+        if "`joint_loocv'" == "exhaustive" {
+            di as txt "Joint LOOCV:" _col(20) as res "exhaustive" as txt " (Cartesian product; default, matches Python 3.1.1)"
+        }
+        else {
+            di as txt "Joint LOOCV:" _col(20) as res "cycling" as txt " (coordinate descent; faster but may differ from Python)"
+        }
+    }
     di as txt ""
     di as txt "Panel dimensions:" _col(20) as res "N = `N', T = `T_val'"
     di as txt "Observations:" _col(20) as res "`N_obs'"
@@ -605,13 +716,29 @@ program define trop, eclass
     local pvalue = e(pvalue)
     local tstat = e(t)
 
+    // Percentile CI from the bootstrap distribution (paper Algorithm 3).
+    // Displayed alongside the t-based CI so users can compare parametric and
+    // distribution-free intervals and detect bootstrap asymmetry.  The
+    // t-based CI is retained as the primary one (e(ci_lower), e(ci_upper))
+    // to preserve backward compatibility with downstream commands such as
+    // `test` and `lincom`.
+    local ci_lower_pct = e(ci_lower_percentile)
+    local ci_upper_pct = e(ci_upper_percentile)
+
     di as txt "  tau     = " as res %12.6f `att'
     if `bootstrap' > 0 {
         di as txt "  SE     = " as res %12.6f `se'
         di as txt "  t      = " as res %12.4f `tstat'
         di as txt "  p-value= " as res %12.4f `pvalue'
-        di as txt "  `level'% CI = [" as res %12.6f `ci_lower' as txt ", " ///
+        di as txt "  `level'% CI (t-based)   " _col(27) "= [" ///
+            as res %12.6f `ci_lower' as txt ", " ///
             as res %12.6f `ci_upper' as txt "]"
+        if !missing(`ci_lower_pct') & !missing(`ci_upper_pct') {
+            di as txt "  `level'% CI (percentile)" _col(27) "= [" ///
+                as res %12.6f `ci_lower_pct' as txt ", " ///
+                as res %12.6f `ci_upper_pct' as txt "]" ///
+                as txt "  {it:(paper Alg 3)}"
+        }
     }
     else {
         di as txt "  SE     = " as res "(not computed)" ///
@@ -656,14 +783,15 @@ program define trop, eclass
 
     // Bootstrap summary
     if `bootstrap' > 0 {
-        di as txt _n "Bootstrap inference:"
+        di as txt _n "Bootstrap inference (paper Alg 3):"
         di as txt "  Replications: " as res `bootstrap'
         di as txt "  Alpha level: " as res `bsalpha'
     }
     else {
-        di as txt _n "{it:Note: Standard errors require bootstrap.}"
-        di as txt "{it:  Example: trop `depvar' `treatvar', panelvar(`panelvar') timevar(`timevar') bootstrap(200)}"
-        di as txt "{it:  Or post-estimation: trop_bootstrap, nreps(200)}"
+        di as txt _n "{it:Note: Bootstrap inference skipped (bootstrap(0)).}"
+        di as txt "{it:  Standard errors per Athey et al. (2025) Algorithm 3 require bootstrap.}"
+        di as txt "{it:  To enable inference, re-run without bootstrap(0) (default is 200 reps),}"
+        di as txt "{it:  or call: trop_bootstrap, nreps(200)}"
     }
 
     di as txt "{hline 78}"

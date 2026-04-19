@@ -184,6 +184,12 @@ void trop_prepare_output_matrices(
     st_matrix("__trop_tau", J(n_treated, 1, 0))
     st_matrix("__trop_factor_matrix", J(n_periods, n_units, 0))
 
+    /* Per-observation diagnostics for the twostep method.  Pre-allocate so
+       the plugin can always st_store into these matrices.  -1 sentinels
+       distinguish "never written" from "solver returned failure". */
+    st_matrix("__trop_converged_by_obs", J(n_treated, 1, -1))
+    st_matrix("__trop_n_iters_by_obs",   J(n_treated, 1, -1))
+
     /* Weight vectors for both estimator variants.
        SF_mat_store() requires the target matrix to exist before the
        plugin call. */
@@ -199,7 +205,6 @@ void trop_prepare_output_matrices(
   Stores estimation options as Stata scalars for the plugin.
 
   Arguments
-    max_loocv_samples   maximum LOOCV evaluation points
     max_iter            maximum iterations for alternating minimization
     tol                 convergence tolerance
     seed                PRNG seed for bootstrap
@@ -209,7 +214,6 @@ void trop_prepare_output_matrices(
 ──────────────────────────────────────────────────────────────────────────────*/
 
 void trop_prepare_options(
-    real scalar max_loocv_samples,
     real scalar max_iter,
     real scalar tol,
     real scalar seed,
@@ -218,7 +222,6 @@ void trop_prepare_options(
     real scalar verbose
 )
 {
-    st_numscalar("__trop_max_loocv_samples", max_loocv_samples)
     st_numscalar("__trop_max_iter", max_iter)
     st_numscalar("__trop_tol", tol)
     st_numscalar("__trop_seed", seed)

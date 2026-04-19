@@ -68,36 +68,69 @@ program define _trop_set_grid
     // equal weighting; large lambda concentrates weight on nearby
     // units or periods and imposes stronger nuclear-norm shrinkage.
     
+    // Per paper Eq 3 the weights θ, ω are exp(−λ · dist), defined for
+    // λ ∈ [0, ∞); λ_time = λ_unit = 0 gives uniform weights.  λ_time =
+    // λ_unit = ∞ is not a valid estimator configuration (it collapses
+    // weight to the target period/unit only), so it is excluded from
+    // every default and custom grid and rejected downstream.
+    //
+    // λ_nn = ∞ is the paper's DID/TWFE special case (Eq 2 remark: for
+    // λ_nn = ∞, ω = θ = 1, we recover DID/TWFE).  It is included in the
+    // default grid as the Stata missing literal "." so that LOOCV may
+    // select it when the data are well-described by an additive model.
     if "`grid_style'" == "default" {
-        // 6 x 6 x 5 = 180 combinations
+        // 6 x 6 x 6 = 216 combinations
         local default_time_grid "0 0.1 0.5 1 2 5"
         local default_unit_grid "0 0.1 0.5 1 2 5"
-        local default_nn_grid "0 0.01 0.1 1 10"
+        local default_nn_grid "0 0.01 0.1 1 10 ."
     }
     else {
-        // 14 x 16 x 18 = 4032 combinations
+        // 14 x 16 x 19 = 4256 combinations
         local default_time_grid "0 0.1 0.2 0.25 0.3 0.35 0.4 0.5 0.75 1 1.5 2 3 5"
         local default_unit_grid "0 0.1 0.2 0.25 0.3 0.35 0.4 0.5 0.75 1 1.2 1.5 1.6 2 3 5"
-        local default_nn_grid "0 0.005 0.006 0.01 0.011 0.02 0.05 0.1 0.15 0.151 0.2 0.3 0.5 0.7 0.9 1 5 10"
+        local default_nn_grid "0 0.005 0.006 0.01 0.011 0.02 0.05 0.1 0.15 0.151 0.2 0.3 0.5 0.7 0.9 1 5 10 ."
     }
     
     // --- apply custom overrides ---
     // user-supplied grids take priority over preset values
-    
+
+    // Reject "." (Stata missing / inf) in lambda_time_grid and
+    // lambda_unit_grid per paper Eq 3, which defines λ on [0, ∞) only.
+    // λ_nn may legitimately be ∞ (DID/TWFE special case, Eq 2 remark).
     if `has_custom_time' {
+        foreach _v of local lambda_time_grid {
+            if "`_v'" == "." {
+                di as error "lambda_time_grid() does not accept `.' (missing / inf)."
+                di as error "  Paper Eq 3: θ_s = exp(−λ_time · |t − s|) is defined for"
+                di as error "  λ_time ∈ [0, ∞); λ_time = 0 recovers uniform time weights."
+                di as error "  λ_time = ∞ collapses all weight onto the target period,"
+                di as error "  which is degenerate and not a supported configuration."
+                exit 198
+            }
+        }
         local final_time_grid "`lambda_time_grid'"
     }
     else {
         local final_time_grid "`default_time_grid'"
     }
-    
+
     if `has_custom_unit' {
+        foreach _v of local lambda_unit_grid {
+            if "`_v'" == "." {
+                di as error "lambda_unit_grid() does not accept `.' (missing / inf)."
+                di as error "  Paper Eq 3: ω_j = exp(−λ_unit · dist(j, i)) is defined for"
+                di as error "  λ_unit ∈ [0, ∞); λ_unit = 0 recovers uniform unit weights."
+                di as error "  λ_unit = ∞ collapses all weight onto the target unit,"
+                di as error "  which is degenerate and not a supported configuration."
+                exit 198
+            }
+        }
         local final_unit_grid "`lambda_unit_grid'"
     }
     else {
         local final_unit_grid "`default_unit_grid'"
     }
-    
+
     if `has_custom_nn' {
         local final_nn_grid "`lambda_nn_grid'"
     }

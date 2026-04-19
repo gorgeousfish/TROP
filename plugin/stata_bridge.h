@@ -53,6 +53,7 @@
 typedef enum {
     CMD_LOOCV_TWOSTEP,
     CMD_LOOCV_JOINT,
+    CMD_LOOCV_JOINT_EXHAUSTIVE,
     CMD_ESTIMATE_TWOSTEP,
     CMD_ESTIMATE_JOINT,
     CMD_BOOTSTRAP_TWOSTEP,
@@ -117,18 +118,14 @@ extern "C" {
  * @param lambda_unit_grid_len  Length of lambda_unit grid
  * @param lambda_nn_grid_ptr    Candidate values for lambda_nn
  * @param lambda_nn_grid_len    Length of lambda_nn grid
- * @param max_loocv_samples     Maximum LOOCV leave-one-out samples
  * @param max_iter              Maximum iterations per fit
  * @param tol                   Convergence tolerance
- * @param seed                  Random seed for subsampling
  * @param best_lambda_time_out  [out] Selected lambda_time
  * @param best_lambda_unit_out  [out] Selected lambda_unit
  * @param best_lambda_nn_out    [out] Selected lambda_nn
  * @param best_score_out        [out] Minimum LOOCV score
  * @param n_valid_out           [out] Successful LOOCV fits (nullable)
- * @param n_attempted_out       [out] Attempted LOOCV fits (nullable)
- * @param n_control_total_out   [out] Control observations before subsampling (nullable)
- * @param subsampled_out        [out] 1 if subsampling was applied (nullable)
+ * @param n_attempted_out       [out] Total finite control observations (nullable)
  * @param first_failed_t_out    [out] Period of first failed fit, -1 if none (nullable)
  * @param first_failed_i_out    [out] Unit of first failed fit, -1 if none (nullable)
  * @return 0 on success, nonzero error code otherwise
@@ -146,18 +143,14 @@ extern int stata_loocv_grid_search(
     int lambda_unit_grid_len,
     const double *lambda_nn_grid_ptr,
     int lambda_nn_grid_len,
-    int max_loocv_samples,
     int max_iter,
     double tol,
-    uint64_t seed,
     double *best_lambda_time_out,
     double *best_lambda_unit_out,
     double *best_lambda_nn_out,
     double *best_score_out,
     int *n_valid_out,
     int *n_attempted_out,
-    int *n_control_total_out,
-    int *subsampled_out,
     int *first_failed_t_out,
     int *first_failed_i_out
 );
@@ -188,10 +181,8 @@ extern int stata_loocv_cycling_search_joint(
     int lambda_unit_grid_len,
     const double *lambda_nn_grid_ptr,
     int lambda_nn_grid_len,
-    int max_loocv_samples,
     int max_iter,
     double tol,
-    uint64_t seed,
     int max_cycles,
     double *best_lambda_time_out,
     double *best_lambda_unit_out,
@@ -199,8 +190,43 @@ extern int stata_loocv_cycling_search_joint(
     double *best_score_out,
     int *n_valid_out,
     int *n_attempted_out,
-    int *n_control_total_out,
-    int *subsampled_out,
+    int *first_failed_t_out,
+    int *first_failed_i_out
+);
+
+/**
+ * Exhaustive (Cartesian) LOOCV grid search for the joint estimator.
+ *
+ * Evaluates all |grid|^3 (lambda_time, lambda_unit, lambda_nn) combinations
+ * in parallel and returns the triple minimising the LOOCV criterion Q(lambda).
+ * Matches the Python reference (diff_diff.trop_global, v3.1.1) exactly.
+ *
+ * Use when the Cartesian product is affordable; prefer the cycling variant
+ * for large grids.
+ *
+ * Parameters and return value mirror stata_loocv_cycling_search_joint(),
+ * except that max_cycles is absent (no coordinate descent is performed).
+ */
+extern int stata_loocv_grid_search_joint(
+    const double *y_ptr,
+    const double *d_ptr,
+    const unsigned char *control_mask_ptr,
+    int n_periods,
+    int n_units,
+    const double *lambda_time_grid_ptr,
+    int lambda_time_grid_len,
+    const double *lambda_unit_grid_ptr,
+    int lambda_unit_grid_len,
+    const double *lambda_nn_grid_ptr,
+    int lambda_nn_grid_len,
+    int max_iter,
+    double tol,
+    double *best_lambda_time_out,
+    double *best_lambda_unit_out,
+    double *best_lambda_nn_out,
+    double *best_score_out,
+    int *n_valid_out,
+    int *n_attempted_out,
     int *first_failed_t_out,
     int *first_failed_i_out
 );
@@ -231,6 +257,12 @@ extern int stata_loocv_cycling_search_joint(
  * @param n_treated_out      [out] Number of treated observations
  * @param n_iterations_out   [out] Maximum iterations across observations
  * @param converged_out      [out] 1 if converged, 0 otherwise
+ * @param converged_by_obs_ptr [out, nullable] 0/1 per treated (t,i); -1 on
+ *                             solver failure.  Must be N_treated * int if
+ *                             non-null.  Ordering matches the Rust-side
+ *                             iteration `for t { for i { if D=1 ... } }`.
+ * @param n_iters_by_obs_ptr   [out, nullable] iterations used per treated
+ *                             (t,i); -1 on solver failure.
  * @return 0 on success
  */
 extern int stata_estimate_twostep(
@@ -252,7 +284,9 @@ extern int stata_estimate_twostep(
     double *l_ptr,
     int *n_treated_out,
     int *n_iterations_out,
-    int *converged_out
+    int *converged_out,
+    int *converged_by_obs_ptr,
+    int *n_iters_by_obs_ptr
 );
 
 /**
@@ -270,13 +304,17 @@ extern int stata_estimate_twostep(
  * @param lambda_nn          Nuclear norm regularization parameter
  * @param max_iter           Maximum iterations
  * @param tol                Convergence tolerance
- * @param tau_out            [out] Scalar treatment effect
+ * @param tau_out            [out] Scalar treatment effect (mean of per-cell τ)
  * @param mu_out             [out] Intercept
  * @param alpha_ptr          [out] Unit fixed effects (N)
  * @param beta_ptr           [out] Time fixed effects (T)
  * @param l_ptr              [out] Low-rank component L (T x N, column-major)
  * @param n_iterations_out   [out] Iterations performed
  * @param converged_out      [out] Convergence flag
+ * @param tau_vec_ptr        [out] Per-cell τ_it for treated (i,t) (nullable);
+ *                                 if non-null, must be pre-allocated to hold
+ *                                 at least `n_treated_out` doubles
+ * @param n_treated_out      [out] Number of treated cells written (nullable)
  * @return 0 on success
  */
 extern int stata_estimate_joint(
@@ -295,7 +333,9 @@ extern int stata_estimate_joint(
     double *beta_ptr,
     double *l_ptr,
     int *n_iterations_out,
-    int *converged_out
+    int *converged_out,
+    double *tau_vec_ptr,
+    int *n_treated_out
 );
 
 /**

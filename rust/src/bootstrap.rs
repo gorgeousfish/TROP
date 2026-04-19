@@ -6,7 +6,7 @@
 //! Procedure:
 //!   1. For b = 1, ..., B: draw N_0 control units and N_1 treated units with replacement.
 //!   2. Re-estimate the treatment effect on each bootstrap sample.
-//!   3. Compute the population variance of the B bootstrap estimates.
+//!   3. Compute the sample variance (Bessel-corrected) of the B bootstrap estimates.
 //!
 //! The PRNG is Xoshiro256PlusPlus, seeded deterministically per iteration.
 
@@ -15,8 +15,9 @@ use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
 
+use crate::distance::UnitDistanceCache;
 use crate::estimation::{estimate_model, solve_joint_no_lowrank, solve_joint_with_lowrank};
-use crate::weights::{compute_joint_weights, compute_weight_matrix};
+use crate::weights::{compute_joint_weights, compute_weight_matrix_cached};
 
 // ============================================================================
 // Unit Classification
@@ -190,12 +191,14 @@ pub fn build_bootstrap_matrices_with_mask(
 // Variance and CI Calculation
 // ============================================================================
 
-/// Compute the population variance and standard error of bootstrap estimates.
+/// Compute the sample variance and standard error of bootstrap estimates.
 ///
-/// Uses the 1/B denominator (population variance), since the B replications
-/// form the empirical sampling distribution of the estimator.
+/// Uses the 1/(B−1) denominator (sample variance with Bessel correction),
+/// matching the Python reference implementation (`np.std(..., ddof=1)`)
+/// and standard inferential practice when treating the B replications as
+/// a sample from the bootstrap sampling distribution.
 ///
-///   V = (1/B) Σ (τ_b − τ̄)²,   SE = √V
+///   V = 1/(B−1) Σ (τ_b − τ̄)²,   SE = √V
 ///
 /// Non-finite values are silently discarded before computation.
 ///
@@ -204,7 +207,7 @@ pub fn build_bootstrap_matrices_with_mask(
 ///
 /// # Returns
 /// `(mean, variance, se)`. Returns `(0, 0, 0)` when fewer than two
-/// finite values are available.
+/// finite values are available (variance undefined).
 pub fn compute_bootstrap_variance(estimates: &[f64]) -> (f64, f64, f64) {
     // Filter non-finite values before computing statistics.
     let finite: Vec<f64> = estimates.iter().copied().filter(|x| x.is_finite()).collect();
@@ -216,8 +219,9 @@ pub fn compute_bootstrap_variance(estimates: &[f64]) -> (f64, f64, f64) {
 
     let n = finite.len() as f64;
     let mean = finite.iter().sum::<f64>() / n;
-    // Population variance (1/B denominator).
-    let variance = finite.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    // Sample variance with Bessel correction (1/(B−1) denominator) to
+    // match Python reference `np.std(..., ddof=1)`.
+    let variance = finite.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
     let se = variance.sqrt();
 
     (mean, variance, se)
@@ -297,7 +301,7 @@ fn interpolate_percentile(sorted: &[f64], idx_f: f64) -> f64 {
 pub struct BootstrapResult {
     /// Finite bootstrap ATT estimates retained after filtering.
     pub estimates: Vec<f64>,
-    /// Standard error (√ of population variance).
+    /// Standard error (√ of sample variance with Bessel correction, 1/(B−1)).
     pub se: f64,
     /// Mean of the bootstrap distribution.
     pub mean: f64,
@@ -471,13 +475,20 @@ pub fn bootstrap_trop_variance_full(
                 return None;
             }
 
+            // Build a per-iteration distance cache so the N_treated × N
+            // pairwise distance queries below amortise to O(1) each.
+            // The cache is shape-dependent on the resampled panel, so it
+            // must be rebuilt for every bootstrap draw.
+            let dist_cache = UnitDistanceCache::build(&y_boot.view(), &d_boot.view());
+
             // Estimate τ(t,i) for each treated observation.
             let mut tau_values = Vec::with_capacity(boot_treated.len());
 
             for (t, i) in boot_treated {
-                let weight_matrix = compute_weight_matrix(
+                let weight_matrix = compute_weight_matrix_cached(
                     &y_boot.view(),
                     &d_boot.view(),
+                    &dist_cache,
                     n_periods,
                     n_boot_units,
                     i,
@@ -835,19 +846,20 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_bootstrap_variance_population() {
-        // variance uses 1/B (population variance) matching standard algorithm
+    fn test_compute_bootstrap_variance_sample() {
+        // Variance uses 1/(B−1) (sample variance with Bessel correction)
+        // to match Python reference `np.std(..., ddof=1)`.
         let estimates = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let (mean, variance, se) = compute_bootstrap_variance(&estimates);
 
         // Mean should be 3.0
         assert!((mean - 3.0).abs() < 1e-10);
 
-        // Variance with 1/B: sum((x-3)^2) / 5 = 10/5 = 2.0
-        assert!((variance - 2.0).abs() < 1e-10);
+        // Variance with 1/(B−1): sum((x-3)^2) / 4 = 10/4 = 2.5
+        assert!((variance - 2.5).abs() < 1e-10);
 
-        // SE = sqrt(2.0)
-        assert!((se - 2.0_f64.sqrt()).abs() < 1e-10);
+        // SE = sqrt(2.5)
+        assert!((se - 2.5_f64.sqrt()).abs() < 1e-10);
     }
 
     #[test]
@@ -974,24 +986,25 @@ mod tests {
     }
 
     #[test]
-    fn test_population_variance_vs_bessel() {
-        // Verify our function uses 1/B (population), not 1/(B-1) (Bessel)
+    fn test_bessel_correction_matches_python() {
+        // Verify our function uses 1/(B-1) (Bessel), matching Python 3.1.1
+        // `np.std(..., ddof=1)`.
         let estimates = [1.0, 2.0, 3.0, 4.0, 5.0];
         let n = estimates.len() as f64;
         let mean = estimates.iter().sum::<f64>() / n;
 
-        // Population variance (1/B)
+        // Population variance (1/B) -- legacy behavior we no longer use.
         let variance_population = estimates.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
 
-        // Bessel-corrected variance (1/(B-1))
+        // Bessel-corrected variance (1/(B-1)) -- current behavior.
         let variance_bessel = estimates.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
 
-        // Our function should match population variance
+        // Our function should match Bessel-corrected variance.
         let (_, variance_func, _) = compute_bootstrap_variance(&estimates.to_vec());
-        assert!((variance_func - variance_population).abs() < 1e-10);
+        assert!((variance_func - variance_bessel).abs() < 1e-10);
 
-        // And should NOT match Bessel variance
-        assert!((variance_func - variance_bessel).abs() > 1e-3);
+        // And should NOT match the population variance.
+        assert!((variance_func - variance_population).abs() > 1e-3);
     }
 
     // ========================================================================
@@ -1218,19 +1231,19 @@ mod tests {
         );
     }
 
-    /// Variance formula: V = Σ(τ_b − τ̄)² / B.
+    /// Variance formula: V = Σ(τ_b − τ̄)² / (B−1).
     #[test]
     fn test_bootstrap_variance_formula() {
         let estimates = vec![2.0, 4.0, 6.0, 8.0, 10.0];
         let n = estimates.len() as f64;
 
-        // Manual calculation using population variance (1/B).
+        // Manual calculation using sample variance (1/(B−1), Bessel).
         let mean_manual = estimates.iter().sum::<f64>() / n;
         let variance_manual = estimates
             .iter()
             .map(|x| (x - mean_manual).powi(2))
             .sum::<f64>()
-            / n;
+            / (n - 1.0);
         let se_manual = variance_manual.sqrt();
 
         // Function calculation
@@ -1259,11 +1272,12 @@ mod tests {
         // Verify expected values
         // Mean = (2+4+6+8+10)/5 = 6
         assert!((mean_func - 6.0).abs() < 1e-12);
-        // Variance = ((2-6)^2 + (4-6)^2 + (6-6)^2 + (8-6)^2 + (10-6)^2) / 5
-        //          = (16 + 4 + 0 + 4 + 16) / 5 = 40/5 = 8
-        assert!((variance_func - 8.0).abs() < 1e-12);
-        // SE = sqrt(8) ≈ 2.828
-        assert!((se_func - 8.0_f64.sqrt()).abs() < 1e-12);
+        // Variance (Bessel, 1/(B−1)) =
+        //   ((2-6)^2 + (4-6)^2 + (6-6)^2 + (8-6)^2 + (10-6)^2) / 4
+        // = (16 + 4 + 0 + 4 + 16) / 4 = 40/4 = 10
+        assert!((variance_func - 10.0).abs() < 1e-12);
+        // SE = sqrt(10) ≈ 3.162
+        assert!((se_func - 10.0_f64.sqrt()).abs() < 1e-12);
     }
 
     /// Percentile CI with linear interpolation on 10 values.

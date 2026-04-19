@@ -112,18 +112,14 @@ pub unsafe extern "C" fn stata_loocv_grid_search(
     lambda_unit_grid_len: i32,
     lambda_nn_grid_ptr: *const f64,
     lambda_nn_grid_len: i32,
-    max_loocv_samples: i32,
     max_iter: i32,
     tol: f64,
-    seed: u64,
     best_lambda_time_out: *mut f64,
     best_lambda_unit_out: *mut f64,
     best_lambda_nn_out: *mut f64,
     best_score_out: *mut f64,
     n_valid_out: *mut i32,
     n_attempted_out: *mut i32,
-    n_control_total_out: *mut i32,
-    subsampled_out: *mut i32,
     first_failed_t_out: *mut i32,
     first_failed_i_out: *mut i32,
 ) -> i32 {
@@ -164,8 +160,6 @@ pub unsafe extern "C" fn stata_loocv_grid_search(
             best_score,
             n_valid,
             n_attempted,
-            n_control_total,
-            subsampled,
             first_failed,
         ) = loocv::loocv_grid_search(
             &y,
@@ -175,10 +169,8 @@ pub unsafe extern "C" fn stata_loocv_grid_search(
             lambda_time_grid,
             lambda_unit_grid,
             lambda_nn_grid,
-            max_loocv_samples as usize,
             max_iter as usize,
             tol,
-            seed,
         );
 
         *best_lambda_time_out = best_time;
@@ -191,12 +183,6 @@ pub unsafe extern "C" fn stata_loocv_grid_search(
         }
         if !n_attempted_out.is_null() {
             *n_attempted_out = n_attempted as i32;
-        }
-        if !n_control_total_out.is_null() {
-            *n_control_total_out = n_control_total as i32;
-        }
-        if !subsampled_out.is_null() {
-            *subsampled_out = if subsampled { 1 } else { 0 };
         }
         if !first_failed_t_out.is_null() {
             *first_failed_t_out = match first_failed {
@@ -248,6 +234,12 @@ pub unsafe extern "C" fn stata_estimate_twostep(
     n_treated_out: *mut i32,
     n_iterations_out: *mut i32,
     converged_out: *mut i32,
+    // Optional per-observation diagnostics.  Both nullable; if non-null each
+    // must be pre-allocated to hold N_treated i32 values.  The ordering
+    // matches the outer iteration `for t in 0..T { for i in 0..N { if D=1 } }`
+    // so Mata can reconstruct (t,i) indices by iterating D in the same way.
+    converged_by_obs_ptr: *mut i32,
+    n_iters_by_obs_ptr: *mut i32,
 ) -> i32 {
     catch_panic!({
         if y_ptr.is_null()
@@ -308,11 +300,17 @@ pub unsafe extern "C" fn stata_estimate_twostep(
             converged: bool,
         }
 
+        // Share a single UnitDistanceCache across all treated observations.
+        // Even with a modest N_treated (~10–30), avoiding the per-call
+        // O(T) pairwise distance computation is worthwhile when T is
+        // large (e.g. PWT at T=48).
+        let dist_cache = distance::UnitDistanceCache::build(&y, &d);
+
         let obs_results: Vec<Option<ObsResult>> = treated_obs
             .par_iter()
             .map(|(t, i)| {
-                let weight_matrix = weights::compute_weight_matrix(
-                    &y, &d, np, nu, *i, *t, lt_eff, lu_eff, &time_dist,
+                let weight_matrix = weights::compute_weight_matrix_cached(
+                    &y, &d, &dist_cache, np, nu, *i, *t, lt_eff, lu_eff, &time_dist,
                 );
 
                 match estimation::estimate_model(
@@ -342,7 +340,10 @@ pub unsafe extern "C" fn stata_estimate_twostep(
             })
             .collect();
 
-        // Aggregate: average α, β, L across successful observations.
+        // Aggregate: average α, β, L across successful observations.  The
+        // per-obs diagnostics (`converged_by_obs`, `n_iters_by_obs`) are
+        // aligned with `treated_obs`: one entry per (t,i) in the same order,
+        // with -1 entries marking observations whose solver returned None.
         let mut tau_values: Vec<f64> = Vec::with_capacity(treated_obs.len());
         let mut alpha_sum = Array1::<f64>::zeros(nu);
         let mut beta_sum = Array1::<f64>::zeros(np);
@@ -350,6 +351,8 @@ pub unsafe extern "C" fn stata_estimate_twostep(
         let mut n_successful: usize = 0;
         let mut max_iters: usize = 0;
         let mut all_successful_converged = true;
+        let mut converged_by_obs: Vec<i32> = Vec::with_capacity(treated_obs.len());
+        let mut n_iters_by_obs: Vec<i32> = Vec::with_capacity(treated_obs.len());
 
         for result in obs_results {
             match result {
@@ -365,8 +368,15 @@ pub unsafe extern "C" fn stata_estimate_twostep(
                     if !obs.converged {
                         all_successful_converged = false;
                     }
+                    converged_by_obs.push(if obs.converged { 1 } else { 0 });
+                    n_iters_by_obs.push(obs.n_iters as i32);
                 }
-                None => {}
+                None => {
+                    // Solver failed (e.g. SVD error); keep slot alignment with
+                    // `treated_obs` and mark as -1 for Mata/Stata side.
+                    converged_by_obs.push(-1);
+                    n_iters_by_obs.push(-1);
+                }
             }
         }
 
@@ -385,6 +395,16 @@ pub unsafe extern "C" fn stata_estimate_twostep(
         *n_treated_out = tau_values.len() as i32;
         *n_iterations_out = max_iters as i32;
         *converged_out = if all_successful_converged { 1 } else { 0 };
+
+        // Write per-obs diagnostics when the caller requests them.
+        if !converged_by_obs_ptr.is_null() {
+            let slot = slice::from_raw_parts_mut(converged_by_obs_ptr, converged_by_obs.len());
+            slot.copy_from_slice(&converged_by_obs);
+        }
+        if !n_iters_by_obs_ptr.is_null() {
+            let slot = slice::from_raw_parts_mut(n_iters_by_obs_ptr, n_iters_by_obs.len());
+            slot.copy_from_slice(&n_iters_by_obs);
+        }
 
         if !tau_ptr.is_null() {
             let tau_slice = slice::from_raw_parts_mut(tau_ptr, tau_values.len());
@@ -531,10 +551,8 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
     lambda_unit_grid_len: i32,
     lambda_nn_grid_ptr: *const f64,
     lambda_nn_grid_len: i32,
-    max_loocv_samples: i32,
     max_iter: i32,
     tol: f64,
-    seed: u64,
     max_cycles: i32,
     best_lambda_time_out: *mut f64,
     best_lambda_unit_out: *mut f64,
@@ -542,8 +560,6 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
     best_score_out: *mut f64,
     n_valid_out: *mut i32,
     n_attempted_out: *mut i32,
-    n_control_total_out: *mut i32,
-    subsampled_out: *mut i32,
     first_failed_t_out: *mut i32,
     first_failed_i_out: *mut i32,
 ) -> i32 {
@@ -582,8 +598,6 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
             best_score,
             n_valid,
             n_attempted,
-            n_control_total,
-            subsampled,
             first_failed,
         ) = loocv::loocv_cycling_search_joint(
             &y,
@@ -592,10 +606,8 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
             lambda_time_grid,
             lambda_unit_grid,
             lambda_nn_grid,
-            max_loocv_samples as usize,
             max_iter as usize,
             tol,
-            seed,
             max_cycles as usize,
         );
 
@@ -610,11 +622,123 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
         if !n_attempted_out.is_null() {
             *n_attempted_out = n_attempted as i32;
         }
-        if !n_control_total_out.is_null() {
-            *n_control_total_out = n_control_total as i32;
+        if !first_failed_t_out.is_null() {
+            *first_failed_t_out = match first_failed {
+                Some((t, _)) => t as i32,
+                None => -1,
+            };
         }
-        if !subsampled_out.is_null() {
-            *subsampled_out = if subsampled { 1 } else { 0 };
+        if !first_failed_i_out.is_null() {
+            *first_failed_i_out = match first_failed {
+                Some((_, i)) => i as i32,
+                None => -1,
+            };
+        }
+
+        TropError::Success.code()
+    })
+}
+
+/// Exhaustive (Cartesian) LOOCV grid search for Joint method tuning parameters
+/// (λ_time, λ_unit, λ_nn).
+///
+/// Evaluates every combination in the Cartesian product of the three grids in
+/// parallel and returns the triple that minimises the LOOCV criterion Q(λ).
+/// Complexity is O(|Λ_time| · |Λ_unit| · |Λ_nn|).  Prefer this over the
+/// coordinate-descent variant when the grid is small enough to afford it, as
+/// it matches the Python reference (`diff_diff.trop_global._fit_global`,
+/// v3.1.1) exactly.
+///
+/// The signature mirrors [`stata_loocv_cycling_search_joint`] with the sole
+/// exception that `max_cycles` is absent.
+///
+/// # Returns
+/// `0` on success; a non-zero `TropError` code otherwise.
+///
+/// # Safety
+/// All pointers must be non-null and point to properly sized buffers.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stata_loocv_grid_search_joint(
+    y_ptr: *const f64,
+    d_ptr: *const f64,
+    control_mask_ptr: *const u8,
+    n_periods: i32,
+    n_units: i32,
+    lambda_time_grid_ptr: *const f64,
+    lambda_time_grid_len: i32,
+    lambda_unit_grid_ptr: *const f64,
+    lambda_unit_grid_len: i32,
+    lambda_nn_grid_ptr: *const f64,
+    lambda_nn_grid_len: i32,
+    max_iter: i32,
+    tol: f64,
+    best_lambda_time_out: *mut f64,
+    best_lambda_unit_out: *mut f64,
+    best_lambda_nn_out: *mut f64,
+    best_score_out: *mut f64,
+    n_valid_out: *mut i32,
+    n_attempted_out: *mut i32,
+    first_failed_t_out: *mut i32,
+    first_failed_i_out: *mut i32,
+) -> i32 {
+    catch_panic!({
+        if y_ptr.is_null()
+            || d_ptr.is_null()
+            || control_mask_ptr.is_null()
+            || lambda_time_grid_ptr.is_null()
+            || lambda_unit_grid_ptr.is_null()
+            || lambda_nn_grid_ptr.is_null()
+            || best_lambda_time_out.is_null()
+            || best_lambda_unit_out.is_null()
+            || best_lambda_nn_out.is_null()
+            || best_score_out.is_null()
+        {
+            return TropError::NullPointer.code();
+        }
+
+        let np = n_periods as usize;
+        let nu = n_units as usize;
+
+        let y = ptr_to_array2(y_ptr, np, nu);
+        let d = ptr_to_array2(d_ptr, np, nu);
+        let control_mask = ptr_to_array2_u8(control_mask_ptr, np, nu);
+
+        let lambda_time_grid =
+            slice::from_raw_parts(lambda_time_grid_ptr, lambda_time_grid_len as usize);
+        let lambda_unit_grid =
+            slice::from_raw_parts(lambda_unit_grid_ptr, lambda_unit_grid_len as usize);
+        let lambda_nn_grid = slice::from_raw_parts(lambda_nn_grid_ptr, lambda_nn_grid_len as usize);
+
+        let (
+            best_time,
+            best_unit,
+            best_nn,
+            best_score,
+            n_valid,
+            n_attempted,
+            first_failed,
+        ) = loocv::loocv_grid_search_joint(
+            &y,
+            &d,
+            &control_mask,
+            lambda_time_grid,
+            lambda_unit_grid,
+            lambda_nn_grid,
+            max_iter as usize,
+            tol,
+        );
+
+        *best_lambda_time_out = best_time;
+        *best_lambda_unit_out = best_unit;
+        *best_lambda_nn_out = best_nn;
+        *best_score_out = best_score;
+
+        if !n_valid_out.is_null() {
+            *n_valid_out = n_valid as i32;
+        }
+        if !n_attempted_out.is_null() {
+            *n_attempted_out = n_attempted as i32;
         }
         if !first_failed_t_out.is_null() {
             *first_failed_t_out = match first_failed {
@@ -664,6 +788,8 @@ pub unsafe extern "C" fn stata_estimate_joint(
     l_ptr: *mut f64,
     n_iterations_out: *mut i32,
     converged_out: *mut i32,
+    tau_vec_ptr: *mut f64,
+    n_treated_out: *mut i32,
 ) -> i32 {
     catch_panic!({
         if y_ptr.is_null() || d_ptr.is_null() || tau_out.is_null() || mu_out.is_null() {
@@ -757,6 +883,38 @@ pub unsafe extern "C" fn stata_estimate_joint(
 
                 if !l_ptr.is_null() {
                     array2_to_ptr(&l, l_ptr);
+                }
+
+                // Paper Eq 13: the joint method assembles τ_it for every treated
+                // (i,t) cell as the post-hoc residual Y − μ − α_i − β_t − L_{ti}.
+                // The scalar tau_out equals the mean of these values (Eq 1 ATT).
+                // Exposing the vector lets users inspect cell-level heterogeneity.
+                let mut n_treated_cells: i32 = 0;
+                if !tau_vec_ptr.is_null() {
+                    let mut tau_values: Vec<f64> = Vec::new();
+                    for t in 0..np {
+                        for i in 0..nu {
+                            if d[[t, i]] == 1.0 && y[[t, i]].is_finite() {
+                                tau_values.push(
+                                    y[[t, i]] - mu - alpha[i] - beta[t] - l[[t, i]],
+                                );
+                            }
+                        }
+                    }
+                    n_treated_cells = tau_values.len() as i32;
+                    let tau_slice = slice::from_raw_parts_mut(tau_vec_ptr, tau_values.len());
+                    tau_slice.copy_from_slice(&tau_values);
+                } else {
+                    for t in 0..np {
+                        for i in 0..nu {
+                            if d[[t, i]] == 1.0 && y[[t, i]].is_finite() {
+                                n_treated_cells += 1;
+                            }
+                        }
+                    }
+                }
+                if !n_treated_out.is_null() {
+                    *n_treated_out = n_treated_cells;
                 }
 
                 TropError::Success.code()
