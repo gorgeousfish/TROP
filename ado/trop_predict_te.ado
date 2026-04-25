@@ -60,10 +60,10 @@ program define trop_predict_te
     }
     
     if "`method'" == "joint" {
-        label variable `varlist' "Treatment effect (homogeneous ATT)"
+        label variable `varlist' "Treatment effect (shared tau / ATT)"
     }
     else {
-        label variable `varlist' "Treatment effect (tau_it)"
+        label variable `varlist' "Treatment effect (cell-specific tau_it)"
     }
 end
 

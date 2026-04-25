@@ -165,19 +165,24 @@ pub fn compute_joint_weights(
 
 /// Decompose Twostep weights into separate time and unit vectors.
 ///
-/// Returns (θ, ω) matching the Python `diff_diff-3.1.1` local path (Eq. 3):
+/// Implements the unnormalized exponential kernels of paper Eq. (3):
 ///   θ_s = exp(−λ_time · |t − s|)            (no normalization)
 ///   ω_j = exp(−λ_unit · dist_{−t}(j, i))    (no normalization)
 ///
-/// The kernels are left **unnormalized** on purpose. Both `estimate_model`
-/// and the Python reference compute `w_max = max(W)` and the prox threshold
-/// `λ_nn / (2·w_max)` internally; normalizing here would implicitly rescale
-/// λ_nn and make fixed-λ fits disagree with the Python estimator.
+/// The kernels are left **unnormalized** on purpose.  `estimate_model`
+/// rescales the inner gradient step by `w_max = max(W)` (the Lipschitz
+/// constant of the quadratic loss) and thresholds the SVD at
+/// `λ_nn / (2·w_max)`; normalizing the kernels here would implicitly
+/// rescale λ_nn and make fits at any fixed λ incomparable across panels
+/// of different weight magnitudes.  The unnormalized convention is the
+/// one paper Eq. (3) states explicitly.
 ///
-/// Units treated at the target period receive ω_j = 0 (the paper's Eq. 3
-/// uses the (1 − W) factor through this exclusion). The target unit itself
-/// always gets ω_i = 1 so that the factor model has a well-defined column
-/// for the treated cell.
+/// Units treated at the target period receive ω_j = 0 — equivalent to the
+/// (1 − W_{j, target_period}) factor in Eq. (3) for the target period row.
+/// The target unit i always gets ω_i = 1, because `dist_{−t}(i, i) = 0` by
+/// the Eq. (3) definition, so `ω_i = exp(−λ_unit · 0) = 1` for every
+/// λ_unit.  Hard-coding this value avoids a redundant `compute_unit_distance_for_obs`
+/// call; it is a numerical optimization, not a modelling choice.
 ///
 /// # Arguments
 /// Same as [`compute_weight_matrix`].
@@ -280,15 +285,37 @@ pub fn compute_twostep_weight_vectors_cached(
 
 /// Decompose Joint weights into separate time and unit vectors.
 ///
-/// Returns (δ_time, δ_unit) where:
+/// The joint (homogeneous-τ) estimator sits in paper Remark 6.1, which
+/// only sketches the aggregation and does *not* specify concrete time /
+/// unit kernels.  The distance definitions below are therefore a
+/// reasonable adaptation of Eq. (3) to the shared-weight setting, not a
+/// restatement of a formula in the paper:
+///
 ///   δ_time[s] = exp(−λ_time · |s − center|)
-///     with center = T − T_post / 2
+///     with center = T − T_post / 2 (midpoint of the treated block).
+///     This is the convention used by the Python reference
+///     (`diff_diff.trop_global._compute_global_weights`) and is
+///     preserved here verbatim to keep numerical parity.  Paper
+///     Eq. (3) defines θ_s(λ) = exp(−λ · |s − t|) per *target*
+///     treated period t in Algorithm 1, and Remark 6.1 is silent
+///     on the concrete aggregation kernel under the shared-weight
+///     (joint) setting — we adopt the Python midpoint convention.
+///     In particular, **T_post = 1 is *not* special-cased** to
+///     `center = T − 1`: that would pin the kernel exactly to the
+///     single treated period (Eq. (3) exact) but would diverge from
+///     Python by 0.5 periods, breaking the end-to-end parity tests
+///     (`test_joint_outer_convergence_parity.do`, CPS / PWT).
+///
 ///   δ_unit[j] = exp(−λ_unit · RMSE_j)
-///     where RMSE_j is computed over pre-treatment periods against the
-///     average treated trajectory.
+///     where RMSE_j is the RMSE of unit j's pre-treatment outcomes against
+///     the average treated trajectory.  The RMSE replaces the leave-one-
+///     period-out pairwise distance of Eq. (3) because a single shared
+///     weight vector must summarize every treated cell at once.
 ///
 /// Units with no valid pre-treatment observations receive δ_unit = 0.
-/// When there are no pre-treatment periods, all units receive δ_unit = 1.
+/// When there are no pre-treatment periods (Remark 6.1 is silent on this
+/// degenerate case), all units receive δ_unit = 1; see the branch
+/// comment below.
 ///
 /// # Arguments
 /// Same as [`compute_joint_weights`].
@@ -313,7 +340,21 @@ pub fn compute_joint_weight_vectors(
         }
     }
 
-    // δ_time[s] = exp(−λ_time · |s − center|), center = T − T_post / 2.
+    // δ_time[s] = exp(−λ_time · |s − center|), with
+    //     center = T − T_post / 2     (midpoint of the treated block)
+    //
+    // This matches the Python reference
+    // (`diff_diff.trop_global._compute_global_weights`) verbatim; the
+    // `test_joint_outer_convergence_parity.do` regression suite locks the
+    // end-to-end ATT to that reference on CPS log-wage, PWT log-GDP, and
+    // the simulated seed-42 panel at tol = 1e-6.  Paper Eq. (3) is defined
+    // per *target* treated period in Algorithm 1, and Remark 6.1 is silent
+    // on the concrete aggregation kernel under the shared-weight (joint)
+    // setting, so the Python midpoint convention is preserved as the
+    // numerical ground truth.  T_post = 1 is intentionally *not*
+    // special-cased to `center = T − 1`: doing so would be a cleaner
+    // match to Eq. (3) but would break parity with Python by 0.5 periods
+    // at the treated cell.
     let center = n_periods as f64 - treated_periods as f64 / 2.0;
     let mut delta_time = Array1::<f64>::zeros(n_periods);
     for t in 0..n_periods {
@@ -370,15 +411,37 @@ pub fn compute_joint_weight_vectors(
         } else {
             // No pre-treatment periods (treated_periods >= n_periods).
             //
-            // The Python reference (`diff_diff==3.1.1`, trop_global.py) raises
-            // ValueError at this point.  In the Stata pipeline such data is
-            // already rejected upstream: joint method requires non-staggered
-            // adoption, and panels with no pre-periods fail the minimum
-            // control-period overlap check (`_trop_chk_common_ctrl_periods`).
+            // Paper Remark 6.1 (homogeneous-effect aggregation) is silent on
+            // this degenerate case: the RMSE-over-pre-periods recipe for
+            // δ_unit simply has no input.  In the Stata pipeline such data
+            // is already rejected upstream — joint method requires
+            // non-staggered adoption, and panels with no pre-periods fail
+            // the minimum control-period overlap check
+            // (`_trop_chk_common_ctrl_periods`).
             //
             // This branch therefore only runs under direct FFI / unit-test
-            // usage.  We return uniform unit weights so the downstream code
-            // remains numerically well-defined rather than producing NaNs.
+            // usage.  We return uniform unit weights (δ_unit ≡ 1) so the
+            // downstream code remains numerically well-defined rather than
+            // producing NaNs, but emit a stderr warning on the first unit
+            // so a caller who bypassed the upstream validation sees a
+            // visible signal.
+            //
+            // Audit: 2026-04 first-principles review (section B.3).  The
+            // uniform-fallback decision is documented in the
+            // `compute_joint_weight_vectors` header comment; removing the
+            // stderr warning requires also updating the `trop.sthlp`
+            // documentation of the degenerate branch.
+            if i == 0 {
+                eprintln!(
+                    "trop_stata warning: compute_joint_weight_vectors \
+                     invoked with n_pre == 0 (treated_periods = {}, \
+                     n_periods = {}); falling back to uniform unit weights. \
+                     Upstream Stata validation should have rejected this \
+                     input; see the function header for the Remark 6.1 \
+                     rationale.",
+                    treated_periods, n_periods
+                );
+            }
             delta_unit[i] = 1.0;
         }
     }
@@ -483,11 +546,13 @@ mod tests {
 
     #[test]
     fn test_joint_weights_zero_pre_periods_returns_finite() {
-        // Regression guard for audit finding B-1: when treated_periods ==
-        // n_periods (no pre-period), the Python reference raises
-        // ValueError; trop_stata intentionally returns uniform unit weights
-        // so downstream code stays NaN-free.  This test pins the behaviour
-        // so a future refactor must deliberately change it.
+        // Regression guard for audit finding B-1 / B.3: paper Remark 6.1 is
+        // silent on treated_periods == n_periods (no pre-periods), so
+        // trop_stata intentionally returns uniform unit weights to keep
+        // downstream code NaN-free.  The Rust branch emits an eprintln
+        // warning (see B.3 audit note).  This test pins the defensive
+        // behaviour so a future refactor must deliberately change both the
+        // fallback and the stderr signal.
         let y = array![[1.0, 2.0], [2.0, 3.0]];
         let d = array![[1.0, 1.0], [1.0, 1.0]];
         let (delta_time, delta_unit) =
@@ -506,6 +571,38 @@ mod tests {
         let weights = compute_joint_weights(&y.view(), &d.view(), 0.5, 0.5, 2);
         for &w in weights.iter() {
             assert_eq!(w, 0.0, "fully-treated panel must mask all cells to zero");
+        }
+    }
+
+    #[test]
+    fn test_joint_weights_zero_pre_periods_larger_panel() {
+        // B.3 audit: ensure the n_pre == 0 fallback scales uniformly across
+        // a larger panel and does not degrade to NaN/Inf when more units are
+        // involved.  The panel is fully treated (D == 1 everywhere) so the
+        // fallback branch is exercised across all N units.
+        let y = array![
+            [1.0, 2.0, 3.0, 4.0],
+            [1.5, 2.5, 3.5, 4.5],
+            [2.0, 3.0, 4.0, 5.0],
+        ];
+        let d = array![
+            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ];
+        let (delta_time, delta_unit) =
+            compute_joint_weight_vectors(&y.view(), &d.view(), 0.1, 0.5, 3);
+
+        assert_eq!(delta_time.len(), 3);
+        assert_eq!(delta_unit.len(), 4);
+        for &t in delta_time.iter() {
+            assert!(t.is_finite() && t > 0.0, "time weights must be finite > 0");
+        }
+        for &w in delta_unit.iter() {
+            assert_eq!(
+                w, 1.0,
+                "B.3: every unit weight in the n_pre == 0 fallback must be 1.0"
+            );
         }
     }
 
@@ -626,6 +723,73 @@ mod tests {
                 actual
             );
         }
+    }
+
+    /// Python-parity guard (supersedes the reverted P0-3 draft): for the
+    /// homogeneous-τ aggregation in `compute_joint_weight_vectors` we
+    /// deliberately keep `center = T − T_post / 2` even when `T_post = 1`,
+    /// matching the Python reference
+    /// (`diff_diff.trop_global._compute_global_weights`).  An earlier draft
+    /// "fixed" T_post = 1 to `center = T − 1` on the grounds that it recovers
+    /// paper Eq. (3) exactly; that draft passed this unit test but broke the
+    /// end-to-end `test_joint_outer_convergence_parity.do` regressions on
+    /// CPS log-wage (|Δτ| ≈ 2.94e-4) and PWT log-GDP (|Δτ| ≈ 6.32e-4), which
+    /// lock the ATT to diff-diff 3.1.1 at tol = 1e-6.  Python parity wins
+    /// per the AGENTS.md contract ("Python reference as truth"), so we pin
+    /// the 0.5-period offset here as the intended behavior.
+    #[test]
+    fn test_joint_weights_time_single_post_period_matches_python_midpoint() {
+        let y = array![
+            [1.0, 2.0],
+            [2.0, 3.0],
+            [3.0, 4.0],
+            [4.0, 5.0],
+            [5.0, 6.0]
+        ];
+        // Unit 1 treated only at the final period (T_post = 1).
+        let d = array![
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 1.0]
+        ];
+
+        let lambda_time = 0.4;
+        let n_periods = 5usize;
+        let treated_periods = 1usize;
+
+        let delta = compute_joint_weights(&y.view(), &d.view(), lambda_time, 0.0, treated_periods);
+
+        // Python convention: center = T − T_post / 2 = 5 − 0.5 = 4.5.
+        // With λ_unit = 0 the unit factor is 1 on control cells so δ[s, 0] == δ_time[s].
+        let center = n_periods as f64 - treated_periods as f64 / 2.0;
+        for s in 0..n_periods {
+            let expected = (-lambda_time * (s as f64 - center).abs()).exp();
+            let actual = delta[[s, 0]];
+            assert!(
+                (actual - expected).abs() < 1e-10,
+                "joint δ_time[s={}] must use the Python midpoint center (T − T_post/2): \
+                 expected {}, got {}",
+                s,
+                expected,
+                actual
+            );
+        }
+
+        // At the treated period the kernel sits 0.5 periods away from the
+        // midpoint center, so δ_time[T−1] = exp(−λ_time · 0.5) < 1.  This
+        // is the 0.5-period offset relative to a hypothetical "center =
+        // treated period" kernel; we lock it in so any future refactor has
+        // to opt in consciously if it intends to diverge from Python.
+        let expected_at_treated = (-lambda_time * 0.5f64).exp();
+        assert!(
+            (delta[[n_periods - 1, 0]] - expected_at_treated).abs() < 1e-12,
+            "joint δ_time at the treated period must equal exp(−λ_time · 0.5) \
+             under Python midpoint parity; got {}, expected {}",
+            delta[[n_periods - 1, 0]],
+            expected_at_treated
+        );
     }
 
     #[test]
@@ -1068,7 +1232,7 @@ mod tests {
     /// Numerical cross-validation: compare Twostep weight matrix against
     /// independently computed reference values (T=5, N=4, seed=42,
     /// target_unit=2, target_period=3, λ_time=0.5, λ_unit=0.5). Weights are
-    /// unnormalized (Python `diff_diff-3.1.1` local convention).
+    /// unnormalized per paper Eq. (3).
     #[test]
     fn test_weight_matrix_reference_values() {
         let y = array![

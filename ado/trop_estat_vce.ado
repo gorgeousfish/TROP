@@ -54,6 +54,7 @@ program define trop_estat_vce
     // Determine the variance estimation method.
     // Prioritize e(vcetype); otherwise, infer from bootstrap replication count.
     local vce_method "`e(vcetype)'"
+    local bsvariance "`e(bsvariance)'"
     if "`vce_method'" == "" {
         capture confirm scalar e(bootstrap_reps)
         if !_rc & e(bootstrap_reps) > 0 {
@@ -70,6 +71,12 @@ program define trop_estat_vce
         capture confirm scalar e(bootstrap_reps)
         if !_rc {
             di as txt "  Replications: " as res %8.0f e(bootstrap_reps)
+        }
+        if "`bsvariance'" == "paper" {
+            di as txt "  SE denom:     " as res "paper (1/B)"
+        }
+        else if "`bsvariance'" != "" {
+            di as txt "  SE denom:     " as res "sample (1/(B-1))"
         }
         capture confirm scalar e(n_bootstrap_valid)
         if !_rc {

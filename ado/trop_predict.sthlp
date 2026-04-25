@@ -76,7 +76,9 @@ components stored in {cmd:e(alpha)}, {cmd:e(beta)}, and
 {bf:Joint (Remark 6.1):}
 For all observations, Y(0) = mu + alpha_i + beta_t + L_{t,i}, where mu
 is the global intercept stored in {cmd:e(mu)}, with identification
-constraints alpha_1 = beta_1 = 0.
+constraints alpha_1 = beta_1 = 0.  This is the shared-tau extension used
+when a common treated block and homogeneous effects are substantively
+appropriate.
 
 {phang}
 {opt y1} calculates the potential outcome Y(1) under treatment.
@@ -102,7 +104,8 @@ time periods.
 
 {pmore}
 {bf:Joint:} Returns the homogeneous scalar ATT from {cmd:e(att)} for all
-treated observations.
+treated observations.  This applies the same shared tau to every treated
+cell.
 
 {pmore}
 The same information is available without creating a new variable through
@@ -178,7 +181,9 @@ Under the Twostep method, each treated observation receives an
 observation-specific treatment effect tau_it stored in {cmd:e(tau)}.  The
 {opt te} option returns these heterogeneous effects directly.  Under the
 Joint method, a single scalar ATT is estimated and applied uniformly to
-all treated observations.
+all treated observations.  The {cmd:joint} path is therefore best viewed as
+a shared-weight, homogeneous-effect extension rather than the default TROP
+workflow.
 
 {pstd}
 {bf:Treatment effect sparsity}
@@ -269,7 +274,8 @@ tau_hat_{it} = Y_{it} - alpha_hat_i - beta_hat_t - L_hat_{it}
 Under the Twostep method (Algorithm 2), each treated observation receives
 its own weight matrix and observation-specific treatment effect tau_it.
 Under the Joint method (Remark 6.1), a single set of global weights is
-used and a homogeneous scalar ATT is estimated.
+used and a homogeneous scalar ATT is estimated.  This shared-tau extension
+is intended for simultaneous-adoption designs.
 
 {pstd}
 The triple robustness property (Theorem 5.1) states that the bias

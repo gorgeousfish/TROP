@@ -26,13 +26,58 @@ program trop_bootstrap, eclass
     version 17
 
     syntax [if] [in], ///
-        [Nreps(integer 1000)]   /// number of bootstrap replications B
-        [Level(real -1)]        /// confidence level in percent (10–99.99)
-        [BSalpha(real -1)]      /// significance level alpha (deprecated)
-        [SEED(integer 42)]      /// random-number seed
-        [MAXiter(integer 100)]  /// maximum iterations per replication
-        [TOL(real 1e-6)]        /// convergence tolerance per replication
-        [VERbose]               //  display progress information
+        [Nreps(integer 1000)]    /// number of bootstrap replications B
+        [Level(real -1)]         /// confidence level in percent (10–99.99)
+        [BSalpha(real -1)]       /// significance level alpha (deprecated)
+        [SEED(integer 42)]       /// random-number seed
+        [MAXiter(integer 100)]   /// maximum iterations per replication
+        [TOL(real 1e-6)]         /// convergence tolerance per replication
+        [BSVARiance(string)]     /// variance denominator: "sample" (1/(B-1), default) or "paper" (1/B, Alg 3)
+        [CImethod(string)]       /// primary CI: "percentile" (default), "t", or "normal"
+        [VERbose]                //  display progress information
+
+    // Resolve bsvariance() to an integer ddof forwarded to the plugin.
+    // Default policy mirrors trop.ado: fall back to e(bsvariance) if the
+    // caller omits the option, and finally to "sample".
+    local _bsvar = trim(lower("`bsvariance'"))
+    if "`_bsvar'" == "" {
+        local _bsvar "`e(bsvariance)'"
+        local _bsvar = trim(lower("`_bsvar'"))
+    }
+    if "`_bsvar'" == "" {
+        local _bsvar "sample"
+    }
+    if "`_bsvar'" == "sample" {
+        local _ddof_arg "1"
+    }
+    else if "`_bsvar'" == "paper" | "`_bsvar'" == "population" {
+        local _ddof_arg "0"
+    }
+    else {
+        di as error "bsvariance() must be 'sample' or 'paper'"
+        exit 198
+    }
+
+    // Resolve cimethod() using the same precedence as bsvariance().
+    // Bootstrap here is guaranteed (nreps >= 1), so the "percentile"
+    // default is always viable.  An explicit cimethod() override wins.
+    local _cimethod = trim(lower("`cimethod'"))
+    if "`_cimethod'" == "" {
+        local _cimethod "`e(cimethod)'"
+        local _cimethod = trim(lower("`_cimethod'"))
+        // Strip any downgrade trace stored on e() ("percentile->t" etc.)
+        local _dpos = strpos("`_cimethod'", "->")
+        if `_dpos' > 0 {
+            local _cimethod = substr("`_cimethod'", `_dpos' + 2, length("`_cimethod'"))
+        }
+    }
+    if "`_cimethod'" == "" {
+        local _cimethod "percentile"
+    }
+    if !inlist("`_cimethod'", "percentile", "t", "normal") {
+        di as error "cimethod() must be one of {bf:percentile}, {bf:t}, or {bf:normal}"
+        exit 198
+    }
 
     // ---------------------------------------------------------------
     // Resolve significance level.
@@ -83,6 +128,10 @@ program trop_bootstrap, eclass
     local treatvar  "`e(treatvar)'"
     local panelvar  "`e(panelvar)'"
     local timevar   "`e(timevar)'"
+    // Weight variable (empty when the original call omitted [pweight]).
+    // When non-empty, the Mata runner enables the weighted bootstrap path
+    // and forwards the variable to trop_prepare_pweights().
+    local weight_var "`e(weight_var)'"
 
     local lambda_time = e(lambda_time)
     local lambda_unit = e(lambda_unit)
@@ -130,6 +179,14 @@ program trop_bootstrap, eclass
     // ---------------------------------------------------------------
     marksample touse
     markout `touse' `depvar' `treatvar' `panelvar' `timevar'
+    if "`weight_var'" != "" {
+        capture confirm numeric variable `weight_var'
+        if _rc {
+            di as error "weight_var from e() is missing or non-numeric: `weight_var'"
+            exit 111
+        }
+        markout `touse' `weight_var'
+    }
 
     tempvar panel_idx time_idx
     qui egen `panel_idx' = group(`panelvar') if `touse'
@@ -165,12 +222,17 @@ program trop_bootstrap, eclass
 
     // ---------------------------------------------------------------
     // Delegate to Mata bootstrap wrapper.
+    // The cimethod choice is forwarded via the __trop_cimethod global to
+    // keep the Mata function signature stable; the Mata wrapper reads it
+    // when populating e(ci_lower)/e(ci_upper).
     // ---------------------------------------------------------------
+    mata: st_global("__trop_cimethod", "`_cimethod'")
     mata: _trop_run_post_bootstrap( ///
         "`depvar'", "`treatvar'", "`panel_idx'", "`time_idx'", "`touse'", ///
         `lambda_time', `lambda_unit', `lambda_nn', ///
         `nreps', `bsalpha', `seed', `maxiter', `tol', ///
-        "`method'", ("`verbose'" != ""))
+        "`method'", ("`verbose'" != ""), `_ddof_arg', "`weight_var'")
+    mata: st_global("__trop_cimethod", "")
 
     // ---------------------------------------------------------------
     // Synchronize e(V) with the bootstrap standard error.
@@ -219,6 +281,11 @@ program trop_bootstrap, eclass
             di as txt "(Note: e(V) could not be updated. Use e(se) directly.)"
         }
     }
+
+    // Refresh e(bsvariance) so the e() record reflects the option that
+    // drove this bootstrap (even when the user overrode the original
+    // setting stored by trop).
+    ereturn local bsvariance "`_bsvar'"
 
     // ---------------------------------------------------------------
     // Display results table.
@@ -273,6 +340,8 @@ program _trop_bs_repost_V, eclass
     local _grid_style "`e(grid_style)'"
     local _treatment_pattern "`e(treatment_pattern)'"
     local _data_signature "`e(data_signature)'"
+    local _bsvariance "`e(bsvariance)'"
+    local _cimethod "`e(cimethod)'"
 
     // --- save e() scalars ---
     local _att = e(att)
@@ -281,6 +350,15 @@ program _trop_bs_repost_V, eclass
     local _pvalue = e(pvalue)
     local _ci_lower = e(ci_lower)
     local _ci_upper = e(ci_upper)
+    local _ci_lower_t   = e(ci_lower_t)
+    local _ci_upper_t   = e(ci_upper_t)
+    local _pvalue_t     = e(pvalue_t)
+    local _ci_lower_nor = e(ci_lower_normal)
+    local _ci_upper_nor = e(ci_upper_normal)
+    local _pvalue_nor   = e(pvalue_normal)
+    local _ci_lower_pct = e(ci_lower_percentile)
+    local _ci_upper_pct = e(ci_upper_percentile)
+    local _df_r         = e(df_r)
     local _mu = e(mu)
     local _lambda_time = e(lambda_time)
     local _lambda_unit = e(lambda_unit)
@@ -322,6 +400,7 @@ program _trop_bs_repost_V, eclass
     local _loocv_fail_rate = e(loocv_fail_rate)
     local _loocv_first_failed_t = e(loocv_first_failed_t)
     local _loocv_first_failed_i = e(loocv_first_failed_i)
+    local _bootstrap_fail_rate = e(bootstrap_fail_rate)
     local _n_lambda_time = e(n_lambda_time)
     local _n_lambda_unit = e(n_lambda_unit)
     local _n_lambda_nn = e(n_lambda_nn)
@@ -372,9 +451,14 @@ program _trop_bs_repost_V, eclass
     if "`_grid_style'" != "" ereturn local grid_style "`_grid_style'"
     if "`_treatment_pattern'" != "" ereturn local treatment_pattern "`_treatment_pattern'"
     if "`_data_signature'" != "" ereturn local data_signature "`_data_signature'"
+    if "`_bsvariance'" != "" ereturn local bsvariance "`_bsvariance'"
+    if "`_cimethod'"   != "" ereturn local cimethod   "`_cimethod'"
 
     // --- restore e() scalars ---
     foreach s in att se t pvalue ci_lower ci_upper mu ///
+        ci_lower_t ci_upper_t pvalue_t ///
+        ci_lower_nor ci_upper_nor pvalue_nor ///
+        ci_lower_pct ci_upper_pct df_r ///
         lambda_time lambda_unit lambda_nn loocv_score ///
         converged n_iterations ///
         bootstrap_reps n_bootstrap_valid alpha_level level ///
@@ -388,10 +472,19 @@ program _trop_bs_repost_V, eclass
         loocv_n_valid loocv_n_attempted ///
         loocv_fail_rate ///
         loocv_first_failed_t loocv_first_failed_i ///
+        bootstrap_fail_rate ///
         n_lambda_time n_lambda_unit n_lambda_nn ///
         n_grid_combinations n_grid_per_cycle {
         if !missing(`_`s'') {
-            ereturn scalar `s' = `_`s''
+            // Map the abbreviated local names back to their canonical e()
+            // names.  ci_lower_nor -> ci_lower_normal, etc.
+            local _ename "`s'"
+            if "`s'" == "ci_lower_nor" local _ename "ci_lower_normal"
+            else if "`s'" == "ci_upper_nor" local _ename "ci_upper_normal"
+            else if "`s'" == "pvalue_nor" local _ename "pvalue_normal"
+            else if "`s'" == "ci_lower_pct" local _ename "ci_lower_percentile"
+            else if "`s'" == "ci_upper_pct" local _ename "ci_upper_percentile"
+            ereturn scalar `_ename' = `_`s''
         }
     }
 
@@ -433,13 +526,14 @@ end
     Prepares panel data, invokes the compiled bootstrap routine
     (Algorithm 3), and stores inference results in e().
 
-    The bootstrap resamples control and treated rows independently
+    The bootstrap resamples control and treated units independently
     with replacement, re-estimates the ATT on each bootstrap sample,
     and derives the variance from the empirical distribution of
     {tau^(b)}.  Confidence intervals and p-values are computed from
-    a t-distribution with (N_1 - 1) degrees of freedom when the
-    number of treated units N_1 is finite, or from the standard
-    normal distribution otherwise.
+    a t-distribution with (N_1 - 1) degrees of freedom whenever the
+    number of ever-treated units N_1 is at least 2, and from the
+    standard normal distribution otherwise (Algorithm 3 treats N_1
+    as the cluster count, so a single treated unit collapses df to 0).
 */
 
 version 17
@@ -460,12 +554,21 @@ void _trop_run_post_bootstrap(
     real scalar max_iter,
     real scalar tol,
     string scalar method,
-    real scalar verbose
+    real scalar verbose,
+    | real scalar ddof,
+    string scalar weight_var
 )
 {
-    real scalar rc, n_units, n_periods, n_treated
+    real scalar ddof_eff
+    real scalar have_ddof
+    real scalar have_weight, pw_rc
+    real scalar rc, n_units, n_periods, n_treated, n_treated_units
     real colvector panel_idx, time_idx, d_vec
     real scalar se, ci_lower, ci_upper, pvalue, tstat, att
+    real scalar ci_lower_t, ci_upper_t, pvalue_t
+    real scalar ci_lower_normal, ci_upper_normal, pvalue_normal
+    real scalar ci_lower_pct, ci_upper_pct
+    string scalar cimethod_req, cimethod_used
     real scalar n_bootstrap_valid, level
     real matrix bootstrap_estimates
 
@@ -475,10 +578,22 @@ void _trop_run_post_bootstrap(
     n_units = max(panel_idx)
     n_periods = max(time_idx)
 
-    // Count treated observations (N_1 in Algorithm 3)
+    // Count treated cells (length of the tau vector; used for plugin
+    // output pre-allocation, NOT for the reference df).
     d_vec = st_data(., treatvar, touse_var)
     n_treated = sum(d_vec :!= 0)
     if (n_treated < 1) n_treated = 1
+
+    // Count ever-treated units N_1 (Algorithm 3 cluster count).
+    // Prefer the upstream value already stored on e() by the preceding
+    // `trop` run; fall back to an inline count of unique panel ids with
+    // any treated observation when absent (e.g. after ereturn clear).
+    n_treated_units = _trop_safe_read_scalar("e(N_treated_units)")
+    if (n_treated_units >= .) {
+        real colvector _treated_ids
+        _treated_ids = uniqrows(select(panel_idx, d_vec :!= 0))
+        n_treated_units = rows(_treated_ids)
+    }
 
     if (verbose) {
         printf("{txt}\n")
@@ -492,13 +607,42 @@ void _trop_run_post_bootstrap(
     // Allocate output matrices
     trop_prepare_output_matrices(n_units, n_periods, n_treated)
 
+    // Optional pweight path: set __trop_use_weights and __trop_unit_weights
+    // when the caller forwarded a non-empty variable name.  Without a
+    // weight the plugin falls back to the unweighted bootstrap ABI.
+    st_numscalar("__trop_use_weights", 0)
+    have_weight = (args() >= 17 & weight_var != "")
+    if (have_weight) {
+        pw_rc = trop_prepare_pweights(weight_var, panel_idx_var, touse_var, n_units)
+        if (pw_rc != 0) {
+            errprintf("Failed to prepare pweights for bootstrap (rc=%g)\n", pw_rc)
+            exit(pw_rc)
+        }
+        if (verbose) {
+            printf("{txt}Bootstrap: weighted (pweight = %s)\n", weight_var)
+        }
+    }
+
     // Set regularization parameters (held fixed across replications)
     st_numscalar("__trop_lambda_time", lambda_time)
     st_numscalar("__trop_lambda_unit", lambda_unit)
     st_numscalar("__trop_lambda_nn", lambda_nn)
 
-    // Set bootstrap-specific parameters
-    trop_prepare_bootstrap(nreps, alpha, seed, lambda_time, lambda_unit, lambda_nn, max_iter, tol)
+    // Set bootstrap-specific parameters.  Forward ddof only when the
+    // caller supplied a finite value so that legacy sites remain on the
+    // sample-variance default.
+    have_ddof = (args() >= 16 & ddof < .)
+    if (have_ddof) {
+        ddof_eff = (ddof == 0) ? 0 : 1
+        trop_prepare_bootstrap(nreps, alpha, seed,
+            lambda_time, lambda_unit, lambda_nn,
+            max_iter, tol, ddof_eff)
+    }
+    else {
+        trop_prepare_bootstrap(nreps, alpha, seed,
+            lambda_time, lambda_unit, lambda_nn,
+            max_iter, tol)
+    }
 
     // Set algorithm options.  The signature is
     //   trop_prepare_options(max_iter, tol, seed, nreps, alpha, verbose)
@@ -539,27 +683,77 @@ void _trop_run_post_bootstrap(
 
     // ------------------------------------------------------------------
     // Inference.
-    // When N_1 is finite, use a t(N_1 - 1) reference distribution;
-    // otherwise fall back to the standard normal.
+    //   - t(N_1 - 1) wrap when N_1 >= 2 (matches the unit-level
+    //     stratified resampling of Algorithm 3).
+    //   - Standard-normal wrap always (large-sample fallback).
+    //   - Percentile CI from the bootstrap empirical CDF (paper Alg 3).
+    // All three are stored on e(); the authoritative e(ci_lower)/
+    // e(ci_upper) follows __trop_cimethod.
     // ------------------------------------------------------------------
     att = st_numscalar("e(att)")
+
+    // Read percentile CI that the plugin wrote (finite only when bootstrap
+    // produced >= 1 valid replicate, otherwise the reader yields missing).
+    ci_lower_pct = _trop_safe_read_scalar("__trop_ci_lower_percentile")
+    ci_upper_pct = _trop_safe_read_scalar("__trop_ci_upper_percentile")
+
+    // Parametric candidates.
+    ci_lower_t = .
+    ci_upper_t = .
+    pvalue_t = .
+    ci_lower_normal = .
+    ci_upper_normal = .
+    pvalue_normal = .
+    tstat = .
+
     if (se > 0 && se < .) {
         real scalar df_pvalue
         tstat = att / se
-        if (n_treated >= 1 && n_treated < .) {
-            df_pvalue = max((1, n_treated - 1))
-            pvalue = 2 * ttail(df_pvalue, abs(tstat))
-            ci_lower = att - invttail(df_pvalue, alpha/2) * se
-            ci_upper = att + invttail(df_pvalue, alpha/2) * se
+        pvalue_normal = 2 * normal(-abs(tstat))
+        ci_lower_normal = att - invnormal(1 - alpha/2) * se
+        ci_upper_normal = att + invnormal(1 - alpha/2) * se
+
+        if (n_treated_units >= 2 && n_treated_units < .) {
+            df_pvalue = max((1, n_treated_units - 1))
+            pvalue_t = 2 * ttail(df_pvalue, abs(tstat))
+            ci_lower_t = att - invttail(df_pvalue, alpha/2) * se
+            ci_upper_t = att + invttail(df_pvalue, alpha/2) * se
         }
         else {
-            pvalue = 2 * normal(-abs(tstat))
-            ci_lower = att - invnormal(1 - alpha/2) * se
-            ci_upper = att + invnormal(1 - alpha/2) * se
+            pvalue_t = pvalue_normal
+            ci_lower_t = ci_lower_normal
+            ci_upper_t = ci_upper_normal
         }
     }
+
+    // Resolve cimethod from the ADO wrapper (set through __trop_cimethod
+    // global); default to "percentile" when the string is empty.
+    cimethod_req = st_global("__trop_cimethod")
+    if (cimethod_req == "") {
+        cimethod_req = "percentile"
+    }
+    cimethod_used = cimethod_req
+    if (cimethod_req == "percentile" && (ci_lower_pct >= . || ci_upper_pct >= .)) {
+        cimethod_used = "t"
+    }
+
+    if (cimethod_used == "percentile") {
+        ci_lower = ci_lower_pct
+        ci_upper = ci_upper_pct
+        pvalue = pvalue_t
+    }
+    else if (cimethod_used == "normal") {
+        ci_lower = ci_lower_normal
+        ci_upper = ci_upper_normal
+        pvalue = pvalue_normal
+    }
     else {
-        tstat = .
+        ci_lower = ci_lower_t
+        ci_upper = ci_upper_t
+        pvalue = pvalue_t
+    }
+
+    if (tstat >= .) {
         pvalue = .
         ci_lower = .
         ci_upper = .
@@ -576,8 +770,37 @@ void _trop_run_post_bootstrap(
     st_numscalar("e(n_bootstrap_valid)", n_bootstrap_valid)
     st_numscalar("e(level)", level)
     st_global("e(vcetype)", "Bootstrap")
-    if (n_treated >= 1 && n_treated < .) {
-        st_numscalar("e(df_r)", max((1, n_treated - 1)))
+
+    // All three candidate CI pairs are persisted so consumers can switch
+    // cimethod without rerunning the bootstrap.
+    if (ci_lower_t < . & ci_upper_t < .) {
+        st_numscalar("e(ci_lower_t)", ci_lower_t)
+        st_numscalar("e(ci_upper_t)", ci_upper_t)
+        st_numscalar("e(pvalue_t)", pvalue_t)
+    }
+    if (ci_lower_normal < . & ci_upper_normal < .) {
+        st_numscalar("e(ci_lower_normal)", ci_lower_normal)
+        st_numscalar("e(ci_upper_normal)", ci_upper_normal)
+        st_numscalar("e(pvalue_normal)", pvalue_normal)
+    }
+    if (ci_lower_pct < . & ci_upper_pct < .) {
+        st_numscalar("e(ci_lower_percentile)", ci_lower_pct)
+        st_numscalar("e(ci_upper_percentile)", ci_upper_pct)
+    }
+
+    // Record the CI method (with downgrade trace when applicable).
+    if (cimethod_used != cimethod_req) {
+        st_global("e(cimethod)", cimethod_req + "->" + cimethod_used)
+    }
+    else {
+        st_global("e(cimethod)", cimethod_used)
+    }
+
+    if (n_treated_units >= 2 && n_treated_units < .) {
+        st_numscalar("e(df_r)", max((1, n_treated_units - 1)))
+    }
+    else {
+        st_numscalar("e(df_r)", .)
     }
 
     // Store the empirical bootstrap distribution, dropping missing entries

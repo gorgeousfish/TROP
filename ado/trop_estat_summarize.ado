@@ -119,10 +119,18 @@ program define trop_estat_summarize
     di as txt "Estimation details:"
 
     if "`e(method)'" != "" {
-        di as txt "  Method:        " as res "`e(method)'"
+        if "`e(method)'" == "joint" {
+            di as txt "  Method:        " as res "joint" ///
+                as txt " (Remark 6.1 extension; shared tau)"
+        }
+        else {
+            di as txt "  Method:        " as res "twostep" ///
+                as txt " (Algorithm 2 default)"
+        }
     }
     else {
-        di as txt "  Method:        " as res "twostep (default)"
+        di as txt "  Method:        " as res "twostep" ///
+            as txt " (Algorithm 2 default)"
     }
 
     di as txt "  Outcome var:   " as res "`e(depvar)'"

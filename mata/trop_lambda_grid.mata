@@ -31,9 +31,11 @@ mata set matastrict on
   Returns:
     column vector of non-negative grid values
 
-  The baseline grid yields 6 x 6 x 5 = 180 triplet combinations.
-  The extended grid yields 14 x 16 x 18 = 4032 triplet combinations,
-  providing denser coverage of empirically relevant regions.
+  The baseline grid yields 6 x 6 x 5 = 180 triplet combinations, using
+  a five-point log-decade ladder for λ_nn that covers the empirically
+  relevant range of the paper's Eq. 2 nuclear-norm penalty.
+  The extended grid yields 14 x 16 x 19 = 4,256 triplet combinations
+  and includes the DID/TWFE corner (λ_nn = ∞, encoded as Stata missing).
 ------------------------------------------------------------------------------*/
 real colvector trop_get_lambda_grid(string scalar grid_style, string scalar param_name)
 {
@@ -41,6 +43,17 @@ real colvector trop_get_lambda_grid(string scalar grid_style, string scalar para
 
     grid = J(0, 1, .)
 
+    // λ_time and λ_unit grids span [0, ∞): λ = 0 recovers uniform weights;
+    // λ = ∞ would collapse weight onto the target period/unit only (not a
+    // supported configuration, see Eq. 3 of the paper).
+    //
+    // λ_nn = +∞ (Stata missing .) is the paper's DID/TWFE corner (L ≡ 0,
+    // Eq. 2 remark).  It is exposed only through `grid_style(extended)`,
+    // keeping the `default` preset to a five-point log-decade ladder for
+    // λ_nn; callers wanting LOOCV to evaluate the DID/TWFE corner should
+    // opt in via `extended` or a custom grid.  The `fine` style is exposed
+    // only through the ADO layer (module-level preset); Mata retains
+    // `default` and `extended` for legacy entry points.
     if (grid_style == "default") {
         if (param_name == "time") {
             grid = (0 \ 0.1 \ 0.5 \ 1 \ 2 \ 5)
@@ -64,7 +77,7 @@ real colvector trop_get_lambda_grid(string scalar grid_style, string scalar para
             grid = (0 \ 0.1 \ 0.2 \ 0.25 \ 0.3 \ 0.35 \ 0.4 \ 0.5 \ 0.75 \ 1 \ 1.2 \ 1.5 \ 1.6 \ 2 \ 3 \ 5)
         }
         else if (param_name == "nn") {
-            grid = (0 \ 0.005 \ 0.006 \ 0.01 \ 0.011 \ 0.02 \ 0.05 \ 0.1 \ 0.15 \ 0.151 \ 0.2 \ 0.3 \ 0.5 \ 0.7 \ 0.9 \ 1 \ 5 \ 10)
+            grid = (0 \ 0.005 \ 0.006 \ 0.01 \ 0.011 \ 0.02 \ 0.05 \ 0.1 \ 0.15 \ 0.151 \ 0.2 \ 0.3 \ 0.5 \ 0.7 \ 0.9 \ 1 \ 5 \ 10 \ .)
         }
         else {
             errprintf("trop_get_lambda_grid: invalid param_name '%s'\n", param_name)
@@ -402,6 +415,79 @@ real scalar trop_validate_table2_coverage(string scalar grid_style)
     }
 
     return(1)
+}
+
+/*------------------------------------------------------------------------------
+  trop_report_table2_coverage()
+
+  User-facing per-dataset coverage diagnostic for the seven Table 2
+  benchmark applications.  Prints one row per dataset indicating whether
+  each of (lambda_unit, lambda_time, lambda_nn) is present in the supplied
+  grids, and returns the number of fully-covered datasets.
+
+  Arguments:
+    time_grid, unit_grid, nn_grid  - column vectors of the grid actually
+                                     in use (typically from
+                                     e(lambda_time_grid) etc.)
+
+  Returns:
+    Number of fully-covered datasets (0..7).  Seven means every
+    Table 2 optimal triplet is enumerated by the current grid.
+------------------------------------------------------------------------------*/
+real scalar trop_report_table2_coverage(
+    real colvector time_grid,
+    real colvector unit_grid,
+    real colvector nn_grid)
+{
+    string rowvector dataset_names
+    real rowvector table2_time, table2_unit, table2_nn
+    real scalar i, hit_t, hit_u, hit_n, all_hit, n_full
+    string scalar mark_t, mark_u, mark_n
+
+    dataset_names = ("CPS logwage",
+                     "CPS urate",
+                     "PWT",
+                     "Germany",
+                     "Basque",
+                     "Smoking",
+                     "Boatlift")
+    table2_time = (0.1, 0.35, 0.4, 0.2, 0.35, 0.4, 0.2)
+    table2_unit = (0,   1.6,  0.3, 1.2, 0,    0.25, 0.2)
+    table2_nn   = (0.9, 0.011, 0.006, 0.011, 0.006, 0.011, 0.151)
+
+    printf("\n{txt}Table 2 coverage report{col 36}{txt}grid contains optimum?\n")
+    printf("{txt}{hline 12} {hline 14} {hline 13} {hline 11} {hline 10}\n")
+    printf("{txt}%-12s {txt}%-14s {txt}%-13s {txt}%-11s {txt}%-10s\n",
+           "Dataset", "lambda_unit", "lambda_time", "lambda_nn", "Status")
+    printf("{txt}{hline 12} {hline 14} {hline 13} {hline 11} {hline 10}\n")
+
+    n_full = 0
+    for (i = 1; i <= cols(table2_time); i++) {
+        hit_u = sum(abs(unit_grid :- table2_unit[i]) :< 1e-10) > 0
+        hit_t = sum(abs(time_grid :- table2_time[i]) :< 1e-10) > 0
+        hit_n = sum(abs(nn_grid   :- table2_nn[i]  ) :< 1e-10) > 0
+        all_hit = hit_u & hit_t & hit_n
+        if (all_hit) n_full = n_full + 1
+
+        mark_u = hit_u ? "yes" : "no"
+        mark_t = hit_t ? "yes" : "no"
+        mark_n = hit_n ? "yes" : "no"
+
+        printf("{txt}%-12s {res}%4.2f [%-3s]{txt} {res}%4.2f [%-3s]{txt} {res}%5.3f [%-3s]{txt} %s\n",
+               dataset_names[i],
+               table2_unit[i], mark_u,
+               table2_time[i], mark_t,
+               table2_nn[i],   mark_n,
+               all_hit ? "{text:OK}" : "{err}partial{txt}")
+    }
+    printf("{txt}{hline 12} {hline 14} {hline 13} {hline 11} {hline 10}\n")
+    printf("{txt}Fully covered: {res}%g{txt} of 7 benchmarks.\n", n_full)
+    if (n_full < 7) {
+        printf("{txt}Suggestion: use {cmd:grid_style(extended)} or add the missing\n")
+        printf("{txt}values to {cmd:lambda_*_grid()} so every Table 2 optimum is\n")
+        printf("{txt}reachable by the LOOCV search.\n")
+    }
+    return(n_full)
 }
 
 end

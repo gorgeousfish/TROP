@@ -12,12 +12,14 @@
 *      bootstrap    - Bootstrap distribution diagnostics
 *      loocv        - LOOCV hyperparameter selection diagnostics
 *      factors      - Factor matrix (L) analysis
+*      triplerob    - Triple-robustness bias decomposition (paper Theorem 5.1)
 *
 *  Abbreviations:
 *      sum    -> summarize
 *      sens   -> sensitivity
 *      weight -> weights
 *      boot   -> bootstrap
+*      triple -> triplerob
 
 program define trop_estat
     version 17
@@ -57,6 +59,9 @@ program define trop_estat
     else if "`subcmd'" == "factors" {
         trop_estat_factors `rest'
     }
+    else if "`subcmd'" == "triplerob" | "`subcmd'" == "triple" {
+        trop_estat_triplerob `rest'
+    }
     else {
         di as error "estat subcommand '{bf:`subcmd'}' not recognized"
         di as error ""
@@ -68,6 +73,7 @@ program define trop_estat
         di as error "  {bf:bootstrap}   - Bootstrap distribution diagnostics"
         di as error "  {bf:loocv}       - LOOCV hyperparameter selection diagnostics"
         di as error "  {bf:factors}     - Factor matrix (L) SVD analysis"
+        di as error "  {bf:triplerob}   - Triple-robustness bias decomposition (Theorem 5.1)"
         exit 199
     }
 end

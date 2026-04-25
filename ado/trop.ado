@@ -14,11 +14,13 @@
     ------
     trop depvar treatvar [if] [in], panelvar(varname) timevar(varname)
         [method(twostep|joint|local|global) grid_style(default|extended)
-         joint_loocv(cycling|exhaustive)
+         twostep_loocv(cycling|exhaustive) joint_loocv(cycling|exhaustive)
          lambda_time_grid(numlist) lambda_unit_grid(numlist)
          lambda_nn_grid(numlist) fixedlambda(numlist)
          tol(real) maxiter(integer)
          bootstrap(integer) bsalpha(real) seed(integer)
+         bsvariance(sample|paper)
+         cimethod(percentile|t|normal)
          verbose level(cilevel)]
 */
 
@@ -31,7 +33,7 @@ program define trop, eclass
     // requires exactly two variables.  This allows users to verify the
     // installed version without supplying a varlist.
     if `"`0'"' == ", version" | `"`0'"' == ",version" | `"`0'"' == "version" {
-        di as txt "trop version 1.0.0"
+        di as txt "trop version 1.1.0"
         di as txt "Triply Robust Panel Estimator"
         di as txt "Athey, Imbens, Qu & Viviano (2025)"
         di as txt ""
@@ -41,13 +43,18 @@ program define trop, eclass
     }
 
     // --- Syntax parsing ---------------------------------------------------
-    syntax varlist(min=2 max=2) [if] [in], ///
+    // `[pweight]` enables survey-design weighted ATT aggregation: each
+    // treated cell (t, i) receives the pweight attached to unit i.
+    // LOOCV remains unweighted; inference is a pweight-only bootstrap
+    // (no strata / PSU / FPC Rao-Wu rescaling).
+    syntax varlist(min=2 max=2) [if] [in] [pweight/], ///
         Panelvar(varname)                   /// panel (unit) identifier
         Timevar(varname)                    /// time period identifier
         [                                   ///
         Method(string)                      /// "twostep" (per-obs tau) or "joint" (scalar tau)
         Grid_style(string)                  /// grid layout for LOOCV: "default" or "extended"
-        JOint_loocv(string)                 /// joint LOOCV strategy: "cycling" (default) or "exhaustive"
+        TWostep_loocv(string)               /// twostep LOOCV strategy: "cycling" (default) or "exhaustive"
+        JOint_loocv(string)                 /// joint LOOCV strategy: "cycling" or "exhaustive" (default)
         LAMbda_time_grid(numlist)                   /// user-supplied lambda_time grid
         LAMbda_unit_grid(numlist)                   /// user-supplied lambda_unit grid
         LAMbda_nn_grid(numlist missingokay)         /// user-supplied lambda_nn grid (`.` = inf)
@@ -57,9 +64,30 @@ program define trop, eclass
         BOOTstrap(integer 200)              /// number of bootstrap replications (paper Alg 3 default; 0 = skip)
         BSalpha(real -1)                    /// deprecated; retained for backward compatibility
         SEED(integer 42)                    /// RNG seed for bootstrap
+        BSVARiance(string)                  /// bootstrap SE denominator: "sample" (1/(B-1), default) or "paper" (1/B, Alg 3)
+        CImethod(string)                    /// primary CI: "percentile" (Alg 3 default when bootstrap>0), "t", or "normal"
         VERbose                             /// display progress and diagnostic messages
         Level(cilevel)                      /// confidence level for bootstrap CI
         ]
+
+    // --- Resolve pweight expression --------------------------------------
+    // The `/` flag in `[pweight/]` makes `exp` hold the bare variable name
+    // (no leading `=`).  Empty string means pweights were not requested.
+    local weight_var ""
+    if "`weight'" != "" {
+        if "`weight'" != "pweight" {
+            di as error "trop only supports pweight; got `weight'."
+            exit 101
+        }
+        local weight_var = trim("`exp'")
+        // Confirm the expression reduces to a single existing numeric variable.
+        capture confirm numeric variable `weight_var'
+        if _rc {
+            di as error "pweight expression must be a single numeric variable; got: `exp'"
+            di as error "  Example: [pweight=wt]"
+            exit 198
+        }
+    }
 
     // --- Variable extraction ----------------------------------------------
     gettoken depvar treatvar : varlist
@@ -89,28 +117,72 @@ program define trop, eclass
         local grid_style "default"
     }
     if "`joint_loocv'" == "" {
-        // Default to exhaustive Cartesian search to match diff-diff==3.1.1
-        // `_fit_global`, the numerical ground truth.  Users who need speed can
-        // opt into cycling coordinate descent via joint_loocv(cycling).
+        // Default to exhaustive Cartesian search: the joint objective has a
+        // single closed-form WLS solution per grid point, so the O(|grid|^3)
+        // cost is manageable and the result is the exact argmin over the
+        // grid.  Users who need speed can opt into cycling coordinate
+        // descent via joint_loocv(cycling).
         local joint_loocv "exhaustive"
+    }
+    if "`twostep_loocv'" == "" {
+        // Default to the coordinate-descent cycling path: each cycle costs
+        // O(|grid|) LOOCV evaluations per treated observation, which stays
+        // affordable on healthy panel sizes.  Users on small panels (e.g.
+        // Basque/Germany) can opt into exhaustive Cartesian search via
+        // twostep_loocv(exhaustive) to eliminate BLAS-dependent lambda
+        // drift caused by non-convex Q(lambda) surfaces with multiple
+        // local minima.
+        local twostep_loocv "cycling"
     }
     if "`level'" == "" {
         local level = c(level)
     }
 
     // --- Validate joint_loocv() -------------------------------------------
-    // Accept only "exhaustive" (Cartesian product, O(|grid|^3), matches
-    // Python diff-diff 3.1.1 `_fit_global`, default) or "cycling" (coordinate
-    // descent, O(|grid|*max_cycles), faster but may select a different lambda
+    // Accept only "exhaustive" (Cartesian product, O(|grid|^3), default;
+    // guarantees the exact grid argmin) or "cycling" (coordinate descent,
+    // O(|grid|*max_cycles), faster but may select a different lambda
     // because the Q(lambda) surface is non-convex).  The option is parsed
     // for any method() but only takes effect for method("joint") with LOOCV
     // enabled.
     if !inlist("`joint_loocv'", "cycling", "exhaustive") {
         di as error "joint_loocv() must be either {bf:exhaustive} or {bf:cycling}"
         di as error "  exhaustive (default): Cartesian product, O(|grid|^3),"
-        di as error "                        matches Python diff-diff 3.1.1"
+        di as error "                        guarantees the global grid minimum"
         di as error "  cycling             : coordinate descent, O(|grid|*cycles),"
         di as error "                        faster but may select a different lambda"
+        exit 198
+    }
+
+    // --- Validate twostep_loocv() -----------------------------------------
+    // Accept only "cycling" (default) or "exhaustive".  The option is parsed
+    // for any method() but only takes effect for method("twostep") with LOOCV
+    // enabled.
+    if !inlist("`twostep_loocv'", "cycling", "exhaustive") {
+        di as error "twostep_loocv() must be either {bf:cycling} or {bf:exhaustive}"
+        di as error "  cycling (default): coordinate-descent, O(|grid|*cycles),"
+        di as error "                     matches the historical default"
+        di as error "  exhaustive       : Cartesian product, O(|grid|^3),"
+        di as error "                     guarantees the global grid minimum"
+        exit 198
+    }
+
+    // --- Validate bootstrap() --------------------------------------------
+    // Bootstrap inference requires at least two replicates so that the
+    // variance denominator (B-1 for sample, B for paper) is strictly
+    // positive.  `bootstrap(0)` is the documented way to skip inference
+    // entirely.  Reject `bootstrap(1)` explicitly because it would leave
+    // the SE undefined (division by zero under ddof=1) while still
+    // producing a misleading non-zero point estimate.
+    if `bootstrap' < 0 {
+        di as error "bootstrap() must be a non-negative integer."
+        exit 198
+    }
+    if `bootstrap' == 1 {
+        di as error "bootstrap(1) is not a valid configuration."
+        di as error "  Use bootstrap(0) to skip inference entirely, or"
+        di as error "  bootstrap(>=2) to produce a valid standard error."
+        di as error "  The default is bootstrap(200)."
         exit 198
     }
 
@@ -129,6 +201,9 @@ program define trop, eclass
     // --- Estimation sample -------------------------------------------------
     marksample touse
     markout `touse' `panelvar' `timevar'
+    if "`weight_var'" != "" {
+        markout `touse' `weight_var'
+    }
 
     // --- Header -----------------------------------------------------------
     di as txt _n "{hline 78}"
@@ -460,28 +535,86 @@ program define trop, eclass
     // The seed is forwarded to the plugin's internal RNG; Stata's global
     // RNG state is left unchanged.
 
-    // Transfer joint_loocv() mode to the Mata layer via a global macro.
-    // The Mata dispatcher _trop_main reads __trop_joint_loocv_mode and
-    // routes to either trop_loocv_joint() or trop_loocv_joint_exhaustive()
-    // when method == "joint" and LOOCV is enabled.
+    // Transfer joint_loocv() / twostep_loocv() modes to the Mata layer via
+    // global macros.  The Mata dispatcher _trop_main reads the corresponding
+    // global and routes to the cycling or exhaustive search variant when
+    // LOOCV is enabled.
     //
-    // The global is set via Mata's st_global() because Stata's `global`
+    // The globals are set via Mata's st_global() because Stata's `global`
     // command rejects names with a leading underscore (r(198)), whereas
     // Mata's st_global() accepts any identifier.
     mata: st_global("__trop_joint_loocv_mode", "`joint_loocv'")
+    mata: st_global("__trop_twostep_loocv_mode", "`twostep_loocv'")
+
+    // Resolve bsvariance() into an integer ddof forwarded to the plugin.
+    // "sample"            -> 1 (Bessel-corrected, default, matches
+    //                         pre-existing Stata behavior)
+    // "paper"|"population"-> 0 (paper Algorithm 3 denominator 1/B)
+    // Empty string        -> "." (defer to Mata default; preserves the
+    //                         historical wire format and avoids forcing a
+    //                         scalar when the user did not request it).
+    local _bsvar = trim(lower("`bsvariance'"))
+    if "`_bsvar'" == "" {
+        local _ddof_arg "."
+    }
+    else if "`_bsvar'" == "sample" {
+        local _ddof_arg "1"
+    }
+    else if "`_bsvar'" == "paper" | "`_bsvar'" == "population" {
+        local _ddof_arg "0"
+    }
+    else {
+        di as error "bsvariance() must be 'sample' or 'paper'"
+        exit 198
+    }
+
+    // Resolve cimethod() into a canonical label.  The primary CI surfaced
+    // via e(ci_lower)/e(ci_upper) is selected here:
+    //   percentile : Algorithm 3 default — distribution-free quantiles of
+    //                the bootstrap empirical CDF; requires bootstrap > 0.
+    //   t          : Gaussian large-sample wrap with t(N_1 - 1) tails.
+    //   normal     : Gaussian large-sample wrap with standard-normal tails.
+    //   <empty>    : auto = "percentile" whenever bootstrap > 0,
+    //                "t" otherwise (SE is missing without bootstrap).
+    // When the user requested bootstrap(0) but also cimethod(percentile)
+    // we downgrade to "t" and print a note; percentile CI cannot be
+    // produced without the empirical distribution.
+    local _cimethod = trim(lower("`cimethod'"))
+    if "`_cimethod'" == "" {
+        if `bootstrap' > 0 {
+            local _cimethod "percentile"
+        }
+        else {
+            local _cimethod "t"
+        }
+    }
+    if !inlist("`_cimethod'", "percentile", "t", "normal") {
+        di as error "cimethod() must be one of {bf:percentile}, {bf:t}, or {bf:normal}"
+        exit 198
+    }
+    if "`_cimethod'" == "percentile" & `bootstrap' <= 0 {
+        di as txt "{it:Note: cimethod(percentile) requires bootstrap > 0; falling back to cimethod(t).}"
+        local _cimethod "t"
+    }
+    mata: st_global("__trop_cimethod", "`_cimethod'")
 
     // Dispatch to the compiled plugin through the Mata interface layer.
     // trop_main() returns 0 on success or a Stata return code on failure.
+    // An empty `weight_var' is treated as "no pweight" by the Mata entry
+    // point (the args() >= 18 guard degrades gracefully).
     mata: st_local("_trop_rc", strofreal(trop_main("`depvar'", "`treatvar'", "`panel_idx'", ///
         "`time_idx'", "`touse'", "`method'", ///
         `lambda_time_val', `lambda_unit_val', `lambda_nn_val', ///
         `run_cv', `bootstrap', `seed', `verbose_flag', ///
-        `maxiter', `tol', `bsalpha')))
+        `maxiter', `tol', `bsalpha', `_ddof_arg', "`weight_var'")))
 
-    // Clear the global once the Mata call returns so that stale state does
-    // not leak into the next estimation.  Setting it to "" via st_global is
-    // equivalent to dropping it from the Mata perspective.
+    // Clear the globals once the Mata call returns so that stale state does
+    // not leak into the next estimation.  Setting to "" via st_global is
+    // equivalent to dropping from the Mata perspective.  Keep
+    // __trop_cimethod until trop_store_results has consumed it (cleared
+    // further below, after the ereturn post cycle).
     mata: st_global("__trop_joint_loocv_mode", "")
+    mata: st_global("__trop_twostep_loocv_mode", "")
 
     // --- Post e(b) and e(V) ----------------------------------------------
     // ereturn post clears all prior e() contents, so it must precede the
@@ -535,6 +668,10 @@ program define trop, eclass
 
     // Transfer remaining estimation results from plugin temporaries to e()
     mata: trop_store_results("`method'")
+
+    // Now safe to release the cimethod global (trop_store_results has
+    // already read it and written e(cimethod)).
+    mata: st_global("__trop_cimethod", "")
     
     // --- Deferred error flag ------------------------------------------------
     local _fatal_rc = 0
@@ -580,6 +717,7 @@ program define trop, eclass
     ereturn local method "`method'"
     ereturn local grid_style "`grid_style'"
     ereturn local joint_loocv "`joint_loocv'"
+    ereturn local twostep_loocv "`twostep_loocv'"
     ereturn local cmd "trop"
     ereturn local estat_cmd "trop_estat"
     ereturn local cmdline "trop `0'"
@@ -587,6 +725,27 @@ program define trop, eclass
     ereturn local treatvar "`treatvar'"
     ereturn local panelvar "`panelvar'"
     ereturn local timevar "`timevar'"
+
+    // --- Attach original-ID row names to e(alpha) and e(beta) ------------
+    // e(alpha) and e(beta) are N x 1 and T x 1 vectors ordered by the
+    // consecutive group() index on (panelvar, timevar).  Users want to
+    // read them keyed by the original panel / time identifiers rather
+    // than by the 1..N / 1..T index.  We query `levelsof` on the
+    // estimation sample (same order as `egen ... = group(...)` inside
+    // the preparation path) and apply the values as matrix row names,
+    // sanitising each to a valid Stata matrix name.  The helper is
+    // silent on mismatch so any future change to panel indexing leaves
+    // the core estimation unharmed.
+    capture _trop_attach_idnames `panelvar' `timevar'
+
+    // Survey-design metadata.  Populated only when [pweight] was supplied;
+    // downstream post-estimation commands (e.g. `trop_bootstrap`) branch
+    // on a non-empty e(weight_var) to enable the weighted Rust path.
+    if "`weight_var'" != "" {
+        ereturn local wtype "pweight"
+        ereturn local wexp "= `weight_var'"
+        ereturn local weight_var "`weight_var'"
+    }
 
     ereturn scalar N_units = `N'
     ereturn scalar N_periods = `T_val'
@@ -599,6 +758,19 @@ program define trop, eclass
     else {
         ereturn local vcetype ""
     }
+
+    // Record the bootstrap-variance denominator for transparency.  An
+    // empty bsvariance() option defers to the Rust default (sample).
+    if "`_bsvar'" == "" {
+        ereturn local bsvariance "sample"
+    }
+    else {
+        ereturn local bsvariance "`_bsvar'"
+    }
+
+    // e(cimethod) is populated by trop_store_results() above and already
+    // reflects percentile->t downgrade when applicable; no ADO-side
+    // override here.
 
     // LOOCV configuration scalars
     ereturn scalar seed = `seed'
@@ -674,14 +846,46 @@ program define trop, eclass
     di as txt "TROP Estimation Results"
     di as txt "{hline 78}"
 
-    di as txt "Method:" _col(20) as res "`method'"
-    di as txt "Grid style:" _col(20) as res "`grid_style'" as txt " (`n_per_cycle' grid points/cycle, coordinate descent)"
-    if "`method'" == "joint" & `run_cv' {
-        if "`joint_loocv'" == "exhaustive" {
-            di as txt "Joint LOOCV:" _col(20) as res "exhaustive" as txt " (Cartesian product; default, matches Python 3.1.1)"
+    if "`method'" == "twostep" {
+        di as txt "Method:" _col(20) as res "twostep" ///
+            as txt " (paper Algorithm 2; default, heterogeneous tau_it)"
+        di as txt "Interpretation:" _col(20) as res "ATT averages cell-specific tau_it"
+    }
+    else {
+        di as txt "Method:" _col(20) as res "joint" ///
+            as txt " (Remark 6.1 extension; homogeneous tau)"
+        di as txt "Interpretation:" _col(20) as res "single shared tau across treated cells"
+        di as txt "Timing restriction:" _col(20) as res "simultaneous adoption required"
+    }
+    if `run_cv' {
+        if ("`method'" == "joint" & "`joint_loocv'" == "exhaustive") | ///
+           ("`method'" == "twostep" & "`twostep_loocv'" == "exhaustive") {
+            di as txt "Grid search:" _col(20) as res "`grid_style'" ///
+                as txt " (`n_combinations' total grid points)"
         }
         else {
-            di as txt "Joint LOOCV:" _col(20) as res "cycling" as txt " (coordinate descent; faster but may differ from Python)"
+            di as txt "Grid search:" _col(20) as res "`grid_style'" ///
+                as txt " (`n_per_cycle' grid points/cycle)"
+        }
+    }
+    else {
+        di as txt "Grid search:" _col(20) as res "`grid_style'" ///
+            as txt " (unused; fixedlambda())"
+    }
+    if "`method'" == "joint" & `run_cv' {
+        if "`joint_loocv'" == "exhaustive" {
+            di as txt "Joint LOOCV:" _col(20) as res "exhaustive" as txt " (Cartesian product; default, guaranteed grid argmin)"
+        }
+        else {
+            di as txt "Joint LOOCV:" _col(20) as res "cycling" as txt " (coordinate descent; faster but may select a different lambda)"
+        }
+    }
+    if "`method'" == "twostep" & `run_cv' {
+        if "`twostep_loocv'" == "exhaustive" {
+            di as txt "Twostep LOOCV:" _col(20) as res "exhaustive" as txt " (Cartesian product; guaranteed global minimum)"
+        }
+        else {
+            di as txt "Twostep LOOCV:" _col(20) as res "cycling" as txt " (coordinate descent; default, faster)"
         }
     }
     di as txt ""
@@ -699,7 +903,16 @@ program define trop, eclass
         }
         di as txt "  lambda_time = " as res %8.4f e(lambda_time)
         di as txt "  lambda_unit = " as res %8.4f e(lambda_unit)
-        di as txt "  lambda_nn   = " as res %8.4f e(lambda_nn)
+        if missing(e(lambda_nn)) {
+            // Stata missing here signals the DID/TWFE corner (lambda_nn = +inf,
+            // Eq. 2 remark: L identically zero).  Render explicitly so the user
+            // sees a human-readable marker rather than the bare "."
+            // rendered by %8.4f.
+            di as txt "  lambda_nn   = " as res "    +inf" as txt " (DID/TWFE corner)"
+        }
+        else {
+            di as txt "  lambda_nn   = " as res %8.4f e(lambda_nn)
+        }
 
         if !missing(e(loocv_score)) {
             di as txt "  Q(lambda_hat) = " as res %10.6f e(loocv_score)
@@ -716,25 +929,62 @@ program define trop, eclass
     local pvalue = e(pvalue)
     local tstat = e(t)
 
-    // Percentile CI from the bootstrap distribution (paper Algorithm 3).
-    // Displayed alongside the t-based CI so users can compare parametric and
-    // distribution-free intervals and detect bootstrap asymmetry.  The
-    // t-based CI is retained as the primary one (e(ci_lower), e(ci_upper))
-    // to preserve backward compatibility with downstream commands such as
-    // `test` and `lincom`.
-    local ci_lower_pct = e(ci_lower_percentile)
-    local ci_upper_pct = e(ci_upper_percentile)
+    // Three candidate intervals are always stored by trop_ereturn_store:
+    //   e(ci_lower_t)/e(ci_upper_t)               t(N_1 - 1) wrap
+    //   e(ci_lower_normal)/e(ci_upper_normal)     standard-normal wrap
+    //   e(ci_lower_percentile)/e(ci_upper_percentile)  paper Alg 3 quantiles
+    // e(ci_lower)/e(ci_upper) holds whichever one `cimethod()` selected.
+    local ci_lower_t    = e(ci_lower_t)
+    local ci_upper_t    = e(ci_upper_t)
+    local ci_lower_nor  = e(ci_lower_normal)
+    local ci_upper_nor  = e(ci_upper_normal)
+    local ci_lower_pct  = e(ci_lower_percentile)
+    local ci_upper_pct  = e(ci_upper_percentile)
+    local cimethod_used = "`e(cimethod)'"
+    local bsvariance_used = "`e(bsvariance)'"
 
     di as txt "  tau     = " as res %12.6f `att'
     if `bootstrap' > 0 {
         di as txt "  SE     = " as res %12.6f `se'
         di as txt "  t      = " as res %12.4f `tstat'
         di as txt "  p-value= " as res %12.4f `pvalue'
-        di as txt "  `level'% CI (t-based)   " _col(27) "= [" ///
+        if "`bsvariance_used'" == "paper" {
+            di as txt "  SE denom= " as res "paper (1/B)"
+        }
+        else {
+            di as txt "  SE denom= " as res "sample (1/(B-1))"
+        }
+        // Header for the primary interval: annotate with the cimethod
+        // selection so users can reproduce which interval is primary.
+        local _ci_label "`cimethod_used'"
+        if strpos("`cimethod_used'", "->") {
+            local _ci_label "`cimethod_used' (downgraded)"
+        }
+        di as txt "  `level'% CI [" as res "`_ci_label'" as txt "]" _col(27) "= [" ///
             as res %12.6f `ci_lower' as txt ", " ///
             as res %12.6f `ci_upper' as txt "]"
-        if !missing(`ci_lower_pct') & !missing(`ci_upper_pct') {
-            di as txt "  `level'% CI (percentile)" _col(27) "= [" ///
+        // Auxiliary intervals: every stored candidate that is NOT the
+        // primary one is echoed below so analysts can compare parametric
+        // and distribution-free intervals at a glance.
+        local _downpos = strpos("`cimethod_used'", "->")
+        if `_downpos' > 0 {
+            local _primary = substr("`cimethod_used'", `_downpos' + 2, length("`cimethod_used'"))
+        }
+        else {
+            local _primary "`cimethod_used'"
+        }
+        if "`_primary'" != "t" & !missing(`ci_lower_t') & !missing(`ci_upper_t') {
+            di as txt "  `level'% CI [t]"           _col(27) "= [" ///
+                as res %12.6f `ci_lower_t'   as txt ", " ///
+                as res %12.6f `ci_upper_t'   as txt "]"
+        }
+        if "`_primary'" != "normal" & !missing(`ci_lower_nor') & !missing(`ci_upper_nor') {
+            di as txt "  `level'% CI [normal]"      _col(27) "= [" ///
+                as res %12.6f `ci_lower_nor' as txt ", " ///
+                as res %12.6f `ci_upper_nor' as txt "]"
+        }
+        if "`_primary'" != "percentile" & !missing(`ci_lower_pct') & !missing(`ci_upper_pct') {
+            di as txt "  `level'% CI [percentile]"  _col(27) "= [" ///
                 as res %12.6f `ci_lower_pct' as txt ", " ///
                 as res %12.6f `ci_upper_pct' as txt "]" ///
                 as txt "  {it:(paper Alg 3)}"
@@ -779,6 +1029,13 @@ program define trop, eclass
                 }
             }
         }
+    }
+
+    // Nuisance-parameter semantics note (twostep only)
+    if "`method'" == "twostep" {
+        di as txt _n "{it:Note: e(alpha)/e(beta)/e(factor_matrix) are averages across}"
+        di as txt "{it:      treated observations (each treated cell fits its own model).}"
+        di as txt "{it:      Per-observation estimates are not stored; see e(alpha_semantics)=""obs_average"".}"
     }
 
     // Bootstrap summary

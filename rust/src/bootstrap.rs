@@ -1,12 +1,25 @@
-//! Bootstrap variance estimation for the TROP estimator.
+//! Bootstrap variance estimation for the TROP estimator (paper Algorithm 3).
 //!
-//! Implements unit-level block bootstrap with stratified resampling to preserve
-//! the ratio of treated to control units.
+//! Implements unit-level block bootstrap with stratified resampling to
+//! preserve the ratio of treated to control units.
 //!
 //! Procedure:
-//!   1. For b = 1, ..., B: draw N_0 control units and N_1 treated units with replacement.
-//!   2. Re-estimate the treatment effect on each bootstrap sample.
-//!   3. Compute the sample variance (Bessel-corrected) of the B bootstrap estimates.
+//!   1. For b = 1, ..., B: draw N_0 control units and N_1 treated units
+//!      with replacement, independently (paper Alg 3 step 4).
+//!   2. Re-estimate the TROP point estimator on each bootstrap sample
+//!      holding λ̂ fixed (paper Alg 3 step 5 read as "apply the same final
+//!      TROP pipeline"; a strict re-LOOCV reading is deferred to a future
+//!      option).
+//!   3. Report the Bessel-corrected sample variance (1/(B−1)) of the B
+//!      bootstrap estimates.
+//!
+//! Variance denominator: paper Algorithm 3 writes
+//!     V̂_τ = (1/B) · Σ (τ̂^(b) − τ̄)² ,
+//! while `compute_bootstrap_variance` uses the 1/(B−1) Bessel-corrected
+//! sample variance (unbiased under the bootstrap distribution).  The two
+//! differ by a factor B/(B−1) ≈ 1 + 1/B, which is negligible for the
+//! default B = 200 (≈ 0.5 %) and is the standard convention for
+//! inferential bootstrap SEs.
 //!
 //! The PRNG is Xoshiro256PlusPlus, seeded deterministically per iteration.
 
@@ -16,7 +29,10 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
 
 use crate::distance::UnitDistanceCache;
-use crate::estimation::{estimate_model, solve_joint_no_lowrank, solve_joint_with_lowrank};
+use crate::estimation::{
+    debug_assert_delta_is_1minus_d_masked, estimate_model, solve_joint_no_lowrank,
+    solve_joint_with_lowrank,
+};
 use crate::weights::{compute_joint_weights, compute_weight_matrix_cached};
 
 // ============================================================================
@@ -191,24 +207,72 @@ pub fn build_bootstrap_matrices_with_mask(
 // Variance and CI Calculation
 // ============================================================================
 
+/// Aggregate per-cell treatment effects into a (possibly weighted) ATT.
+///
+/// When `unit_weights` is `Some(w)`, each (tau, column_index) pair is
+/// aggregated as `τ̂ = Σ w[j] · τ_j / Σ w[j]` where `j` is the column index
+/// within the panel being aggregated.  When `unit_weights` is `None`, the
+/// aggregation collapses to the ordinary mean `τ̂ = Σ τ / n`.
+///
+/// Returns `None` when the effective denominator is zero or when the input
+/// slice is empty.
+///
+/// # Arguments
+/// * `tau_cells` - Slice of `(tau, column_index)` pairs for treated cells.
+/// * `unit_weights` - Optional per-column weights (length ≥ max column index).
+fn aggregate_att(tau_cells: &[(f64, usize)], unit_weights: Option<&[f64]>) -> Option<f64> {
+    if tau_cells.is_empty() {
+        return None;
+    }
+    match unit_weights {
+        Some(w) => {
+            let mut num = 0.0_f64;
+            let mut den = 0.0_f64;
+            for (tau, idx) in tau_cells {
+                let wi = w.get(*idx).copied().unwrap_or(0.0);
+                if !wi.is_finite() || wi <= 0.0 {
+                    continue;
+                }
+                num += wi * tau;
+                den += wi;
+            }
+            if den > 0.0 {
+                Some(num / den)
+            } else {
+                None
+            }
+        }
+        None => {
+            let sum: f64 = tau_cells.iter().map(|(t, _)| t).sum();
+            Some(sum / tau_cells.len() as f64)
+        }
+    }
+}
+
 /// Compute the sample variance and standard error of bootstrap estimates.
 ///
-/// Uses the 1/(B−1) denominator (sample variance with Bessel correction),
-/// matching the Python reference implementation (`np.std(..., ddof=1)`)
-/// and standard inferential practice when treating the B replications as
-/// a sample from the bootstrap sampling distribution.
+/// `ddof` selects the denominator:
+///   - `1` (default, "sample"): `1/(B−1)` — Bessel-corrected sample
+///     variance, unbiased estimator of the bootstrap variance and the
+///     standard convention for inferential bootstrap SEs.
+///   - `0` ("population"): `1/B` — matches paper Algorithm 3's `V̂_τ`
+///     exactly (population variance).
+/// Values `ddof ≥ 2` fall back to `ddof = 1`.
 ///
-///   V = 1/(B−1) Σ (τ_b − τ̄)²,   SE = √V
+/// The two denominators differ by a factor `B/(B−1)`, negligible for the
+/// default `B = 200` (≈ 0.5 %) but visible for small `B` (≈ 2 % at B = 50).
 ///
-/// Non-finite values are silently discarded before computation.
+/// Filters non-finite values before computing statistics (failed bootstrap
+/// iterations yield NaN or ±Inf).
 ///
 /// # Arguments
 /// * `estimates` - Bootstrap ATT estimates (may contain NaN/Inf).
+/// * `ddof`      - Variance denominator offset; see above.
 ///
 /// # Returns
 /// `(mean, variance, se)`. Returns `(0, 0, 0)` when fewer than two
 /// finite values are available (variance undefined).
-pub fn compute_bootstrap_variance(estimates: &[f64]) -> (f64, f64, f64) {
+pub fn compute_bootstrap_variance(estimates: &[f64], ddof: u8) -> (f64, f64, f64) {
     // Filter non-finite values before computing statistics.
     let finite: Vec<f64> = estimates.iter().copied().filter(|x| x.is_finite()).collect();
 
@@ -219,9 +283,16 @@ pub fn compute_bootstrap_variance(estimates: &[f64]) -> (f64, f64, f64) {
 
     let n = finite.len() as f64;
     let mean = finite.iter().sum::<f64>() / n;
-    // Sample variance with Bessel correction (1/(B−1) denominator) to
-    // match Python reference `np.std(..., ddof=1)`.
-    let variance = finite.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    // ddof = 0 → paper Algorithm 3 population variance (1/B).
+    // ddof ≥ 1 → Bessel-corrected sample variance (1/(B−1)); any value
+    // other than 0 collapses to 1 since higher ddof has no meaning for
+    // the bootstrap variance definition.
+    let denom = if ddof == 0 {
+        n
+    } else {
+        (n - 1.0).max(1.0)
+    };
+    let variance = finite.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / denom;
     let se = variance.sqrt();
 
     (mean, variance, se)
@@ -301,7 +372,8 @@ fn interpolate_percentile(sorted: &[f64], idx_f: f64) -> f64 {
 pub struct BootstrapResult {
     /// Finite bootstrap ATT estimates retained after filtering.
     pub estimates: Vec<f64>,
-    /// Standard error (√ of sample variance with Bessel correction, 1/(B−1)).
+    /// Standard error (√ of sample variance with Bessel correction, 1/(B−1));
+    /// paper Algorithm 3 uses 1/B (population variance).
     pub se: f64,
     /// Mean of the bootstrap distribution.
     pub mean: f64,
@@ -358,6 +430,9 @@ pub fn bootstrap_trop_variance(
     seed: u64,
     alpha: f64,
 ) -> (Array1<f64>, f64) {
+    // Legacy wrapper: historical callers assumed Bessel-corrected SE
+    // (ddof = 1).  The `_full` variant now accepts an explicit ddof; this
+    // wrapper pins ddof = 1 for backward compatibility.
     let result = bootstrap_trop_variance_full(
         y,
         d,
@@ -371,6 +446,7 @@ pub fn bootstrap_trop_variance(
         tol,
         seed,
         alpha,
+        1,
     );
     (Array1::from_vec(result.estimates), result.se)
 }
@@ -385,7 +461,10 @@ pub fn bootstrap_trop_variance(
 /// Returns the complete [`BootstrapResult`] including percentile CI.
 ///
 /// # Arguments
-/// See [`bootstrap_trop_variance`] — all parameters are identical.
+/// See [`bootstrap_trop_variance`] — all parameters are identical, plus
+/// `ddof` selecting the variance denominator:
+///   - `1` → Bessel-corrected sample variance `1/(B−1)` (default).
+///   - `0` → paper Algorithm 3 population variance `1/B`.
 ///
 /// # Returns
 /// A [`BootstrapResult`] containing estimates, SE, mean, and CI.
@@ -403,6 +482,7 @@ pub fn bootstrap_trop_variance_full(
     tol: f64,
     seed: u64,
     alpha: f64,
+    ddof: u8,
 ) -> BootstrapResult {
     let y_arr = y.to_owned();
     let d_arr = d.to_owned();
@@ -508,6 +588,7 @@ pub fn bootstrap_trop_variance_full(
                     max_iter,
                     tol,
                     None,
+                    None,
                 ) {
                     let tau = y_boot[[t, i]] - alpha_est[i] - beta[t] - l[[t, i]];
                     if tau.is_finite() {
@@ -527,7 +608,7 @@ pub fn bootstrap_trop_variance_full(
 
     let n_valid = bootstrap_estimates.len();
 
-    let (mean, _, se) = compute_bootstrap_variance(&bootstrap_estimates);
+    let (mean, _, se) = compute_bootstrap_variance(&bootstrap_estimates, ddof);
     let (ci_lower, ci_upper) = compute_percentile_ci(&bootstrap_estimates, alpha);
 
     BootstrapResult {
@@ -575,6 +656,9 @@ pub fn bootstrap_trop_variance_joint(
     seed: u64,
     alpha: f64,
 ) -> (Array1<f64>, f64) {
+    // Legacy wrapper: historical callers assumed Bessel-corrected SE
+    // (ddof = 1).  The `_full` variant now accepts an explicit ddof; this
+    // wrapper pins ddof = 1 for backward compatibility.
     let result = bootstrap_trop_variance_joint_full(
         y,
         d,
@@ -586,6 +670,7 @@ pub fn bootstrap_trop_variance_joint(
         tol,
         seed,
         alpha,
+        1,
     );
     (Array1::from_vec(result.estimates), result.se)
 }
@@ -600,7 +685,9 @@ pub fn bootstrap_trop_variance_joint(
 /// Returns the complete [`BootstrapResult`] including percentile CI.
 ///
 /// # Arguments
-/// See [`bootstrap_trop_variance_joint`] — all parameters are identical.
+/// See [`bootstrap_trop_variance_joint`] — all parameters are identical,
+/// plus `ddof` selecting the variance denominator (see
+/// [`bootstrap_trop_variance_full`]).
 ///
 /// # Returns
 /// A [`BootstrapResult`] containing estimates, SE, mean, and CI.
@@ -616,6 +703,7 @@ pub fn bootstrap_trop_variance_joint_full(
     tol: f64,
     seed: u64,
     alpha: f64,
+    ddof: u8,
 ) -> BootstrapResult {
     let y_arr = y.to_owned();
     let d_arr = d.to_owned();
@@ -677,6 +765,11 @@ pub fn bootstrap_trop_variance_joint_full(
             //
             // τ is post-hoc: mean residual (Y − μ − α − β − L) over treated cells.
             // When λ_nn ≥ 1e10 we skip the low-rank fit and L ≡ 0.
+            // B.2 defensive check: compute_joint_weights (1 − D)-masks δ.
+            debug_assert_delta_is_1minus_d_masked(
+                &d_boot.view(), &delta.view(),
+                "bootstrap::joint/delta",
+            );
             let result = if ln_eff >= 1e10 {
                 solve_joint_no_lowrank(&y_boot.view(), &delta.view()).map(
                     |(mu, alpha_est, beta)| {
@@ -716,7 +809,331 @@ pub fn bootstrap_trop_variance_joint_full(
 
     let n_valid = bootstrap_estimates.len();
 
-    let (mean, _, se) = compute_bootstrap_variance(&bootstrap_estimates);
+    let (mean, _, se) = compute_bootstrap_variance(&bootstrap_estimates, ddof);
+    let (ci_lower, ci_upper) = compute_percentile_ci(&bootstrap_estimates, alpha);
+
+    BootstrapResult {
+        estimates: bootstrap_estimates,
+        se,
+        mean,
+        ci_lower,
+        ci_upper,
+        n_valid,
+        n_total: n_bootstrap,
+        level: 1.0 - alpha,
+    }
+}
+
+/// Weighted twostep bootstrap: pweight-only survey-design variant.
+///
+/// Follows the same procedure as [`bootstrap_trop_variance_full`] but
+/// aggregates the per-cell τ into ATT as `τ̂ = Σ w_i τ_{t,i} / Σ w_i`,
+/// where `w_i` is the pweight attached to the original unit index.
+///
+/// Per-cell estimation (α, β, L) is unchanged — the pweight enters only the
+/// ATT aggregation.  This matches the Python reference implementation for
+/// pweight-only survey designs (no strata / PSU / FPC Rao-Wu rescaling).
+///
+/// # Arguments
+/// Same as [`bootstrap_trop_variance_full`], plus:
+/// * `unit_weights` - Per-original-unit pweights (length = `n_units` of the
+///   original panel, indexed by the pre-bootstrap column index).  Must be
+///   strictly positive and constant within unit (enforced by the caller).
+///
+/// # Returns
+/// A [`BootstrapResult`] with weighted ATT estimates and SE.
+#[allow(clippy::too_many_arguments)]
+pub fn bootstrap_trop_variance_full_weighted(
+    y: &ArrayView2<f64>,
+    d: &ArrayView2<f64>,
+    control_mask: &ArrayView2<u8>,
+    time_dist: &ArrayView2<i64>,
+    lambda_time: f64,
+    lambda_unit: f64,
+    lambda_nn: f64,
+    n_bootstrap: usize,
+    max_iter: usize,
+    tol: f64,
+    seed: u64,
+    alpha: f64,
+    ddof: u8,
+    unit_weights: &[f64],
+) -> BootstrapResult {
+    let y_arr = y.to_owned();
+    let d_arr = d.to_owned();
+    let control_mask_arr = control_mask.to_owned();
+    let time_dist_arr = time_dist.to_owned();
+    let unit_weights_owned: Vec<f64> = unit_weights.to_vec();
+
+    let n_periods = y_arr.nrows();
+
+    let lt_eff = if lambda_time.is_infinite() {
+        0.0
+    } else {
+        lambda_time
+    };
+    let lu_eff = if lambda_unit.is_infinite() {
+        0.0
+    } else {
+        lambda_unit
+    };
+    let ln_eff = if lambda_nn.is_infinite() {
+        1e10
+    } else {
+        lambda_nn
+    };
+
+    let classification = classify_units(&d_arr.view());
+
+    let bootstrap_estimates: Vec<f64> = (0..n_bootstrap)
+        .into_par_iter()
+        .filter_map(|b| {
+            let iteration_seed = seed.wrapping_add(b as u64);
+            let sampled_units = stratified_sample(&classification, iteration_seed);
+
+            let (y_boot, d_boot, control_mask_boot) = build_bootstrap_matrices_with_mask(
+                &y_arr,
+                &d_arr,
+                &control_mask_arr,
+                &sampled_units,
+            );
+
+            let n_boot_units = d_boot.ncols();
+
+            // Propagate per-unit pweights through the bootstrap resampling:
+            // each resampled column `new_idx` inherits the weight of the
+            // original unit `sampled_units[new_idx]`.
+            let w_boot: Vec<f64> = sampled_units
+                .iter()
+                .map(|&orig_idx| unit_weights_owned.get(orig_idx).copied().unwrap_or(0.0))
+                .collect();
+
+            let mut boot_treated: Vec<(usize, usize)> = Vec::new();
+            for t in 0..n_periods {
+                for i in 0..n_boot_units {
+                    if d_boot[[t, i]] == 1.0 {
+                        boot_treated.push((t, i));
+                    }
+                }
+            }
+
+            if boot_treated.is_empty() {
+                return None;
+            }
+
+            let mut boot_control_units: Vec<usize> = Vec::new();
+            for i in 0..n_boot_units {
+                let is_control = (0..n_periods).all(|t| d_boot[[t, i]] == 0.0);
+                if is_control {
+                    boot_control_units.push(i);
+                }
+            }
+
+            if boot_control_units.is_empty() {
+                return None;
+            }
+
+            let dist_cache = UnitDistanceCache::build(&y_boot.view(), &d_boot.view());
+
+            let mut tau_cells: Vec<(f64, usize)> = Vec::with_capacity(boot_treated.len());
+
+            for (t, i) in boot_treated {
+                let weight_matrix = compute_weight_matrix_cached(
+                    &y_boot.view(),
+                    &d_boot.view(),
+                    &dist_cache,
+                    n_periods,
+                    n_boot_units,
+                    i,
+                    t,
+                    lt_eff,
+                    lu_eff,
+                    &time_dist_arr.view(),
+                );
+
+                if let Some((alpha_est, beta, l, _n_iters, _converged)) = estimate_model(
+                    &y_boot.view(),
+                    &control_mask_boot.view(),
+                    &weight_matrix.view(),
+                    ln_eff,
+                    n_periods,
+                    n_boot_units,
+                    max_iter,
+                    tol,
+                    None,
+                    None,
+                ) {
+                    let tau = y_boot[[t, i]] - alpha_est[i] - beta[t] - l[[t, i]];
+                    if tau.is_finite() {
+                        tau_cells.push((tau, i));
+                    }
+                }
+            }
+
+            aggregate_att(&tau_cells, Some(&w_boot)).filter(|a| a.is_finite())
+        })
+        .collect();
+
+    let n_valid = bootstrap_estimates.len();
+
+    let (mean, _, se) = compute_bootstrap_variance(&bootstrap_estimates, ddof);
+    let (ci_lower, ci_upper) = compute_percentile_ci(&bootstrap_estimates, alpha);
+
+    BootstrapResult {
+        estimates: bootstrap_estimates,
+        se,
+        mean,
+        ci_lower,
+        ci_upper,
+        n_valid,
+        n_total: n_bootstrap,
+        level: 1.0 - alpha,
+    }
+}
+
+/// Weighted joint bootstrap: pweight-only survey-design variant.
+///
+/// Follows the same procedure as [`bootstrap_trop_variance_joint_full`] but
+/// extracts the joint-fit parameters `(μ, α, β, L)` and computes the post-hoc
+/// ATT as `τ̂ = Σ w_i (Y_{t,i} − μ − α_i − β_t − L_{t,i}) / Σ w_i`.
+///
+/// The joint estimation of `(μ, α, β, L)` itself is unchanged — pweight
+/// enters only the ATT aggregation.
+///
+/// # Arguments
+/// Same as [`bootstrap_trop_variance_joint_full`], plus:
+/// * `unit_weights` - Per-original-unit pweights (length = `n_units`).
+#[allow(clippy::too_many_arguments)]
+pub fn bootstrap_trop_variance_joint_full_weighted(
+    y: &ArrayView2<f64>,
+    d: &ArrayView2<f64>,
+    lambda_time: f64,
+    lambda_unit: f64,
+    lambda_nn: f64,
+    n_bootstrap: usize,
+    max_iter: usize,
+    tol: f64,
+    seed: u64,
+    alpha: f64,
+    ddof: u8,
+    unit_weights: &[f64],
+) -> BootstrapResult {
+    let y_arr = y.to_owned();
+    let d_arr = d.to_owned();
+    let unit_weights_owned: Vec<f64> = unit_weights.to_vec();
+
+    let n_units = y_arr.ncols();
+    let n_periods = y_arr.nrows();
+
+    let classification = classify_units(&d_arr.view());
+
+    let mut first_treat_period = n_periods;
+    for t in 0..n_periods {
+        for i in 0..n_units {
+            if d_arr[[t, i]] == 1.0 {
+                first_treat_period = first_treat_period.min(t);
+                break;
+            }
+        }
+    }
+    let treated_periods = n_periods.saturating_sub(first_treat_period);
+
+    let lt_eff = if lambda_time.is_infinite() {
+        0.0
+    } else {
+        lambda_time
+    };
+    let lu_eff = if lambda_unit.is_infinite() {
+        0.0
+    } else {
+        lambda_unit
+    };
+    let ln_eff = if lambda_nn.is_infinite() {
+        1e10
+    } else {
+        lambda_nn
+    };
+
+    let bootstrap_estimates: Vec<f64> = (0..n_bootstrap)
+        .into_par_iter()
+        .filter_map(|b| {
+            let iteration_seed = seed.wrapping_add(b as u64);
+            let sampled_units = stratified_sample(&classification, iteration_seed);
+
+            let (y_boot, d_boot) = build_bootstrap_matrices(&y_arr, &d_arr, &sampled_units);
+            let nu_b = y_boot.ncols();
+
+            let w_boot: Vec<f64> = sampled_units
+                .iter()
+                .map(|&orig_idx| unit_weights_owned.get(orig_idx).copied().unwrap_or(0.0))
+                .collect();
+
+            let delta = compute_joint_weights(
+                &y_boot.view(),
+                &d_boot.view(),
+                lt_eff,
+                lu_eff,
+                treated_periods,
+            );
+
+            debug_assert_delta_is_1minus_d_masked(
+                &d_boot.view(), &delta.view(),
+                "bootstrap::joint_weighted/delta",
+            );
+
+            // Collect (tau, column_index) pairs for weighted aggregation.
+            let tau_cells_opt: Option<Vec<(f64, usize)>> = if ln_eff >= 1e10 {
+                solve_joint_no_lowrank(&y_boot.view(), &delta.view()).map(
+                    |(mu, alpha_est, beta)| {
+                        let mut cells: Vec<(f64, usize)> = Vec::new();
+                        for t in 0..n_periods {
+                            for i in 0..nu_b {
+                                if d_boot[[t, i]] == 1.0 && y_boot[[t, i]].is_finite() {
+                                    let tau_val =
+                                        y_boot[[t, i]] - mu - alpha_est[i] - beta[t];
+                                    cells.push((tau_val, i));
+                                }
+                            }
+                        }
+                        cells
+                    },
+                )
+            } else {
+                solve_joint_with_lowrank(
+                    &y_boot.view(),
+                    &d_boot.view(),
+                    &delta.view(),
+                    ln_eff,
+                    max_iter,
+                    tol,
+                )
+                .map(|(mu, alpha_est, beta, l, _tau, _iters, _converged)| {
+                    let mut cells: Vec<(f64, usize)> = Vec::new();
+                    for t in 0..n_periods {
+                        for i in 0..nu_b {
+                            if d_boot[[t, i]] == 1.0 && y_boot[[t, i]].is_finite() {
+                                let tau_val = y_boot[[t, i]]
+                                    - mu
+                                    - alpha_est[i]
+                                    - beta[t]
+                                    - l[[t, i]];
+                                cells.push((tau_val, i));
+                            }
+                        }
+                    }
+                    cells
+                })
+            };
+
+            tau_cells_opt
+                .and_then(|cells| aggregate_att(&cells, Some(&w_boot)))
+                .filter(|a| a.is_finite())
+        })
+        .collect();
+
+    let n_valid = bootstrap_estimates.len();
+
+    let (mean, _, se) = compute_bootstrap_variance(&bootstrap_estimates, ddof);
     let (ci_lower, ci_upper) = compute_percentile_ci(&bootstrap_estimates, alpha);
 
     BootstrapResult {
@@ -847,10 +1264,12 @@ mod tests {
 
     #[test]
     fn test_compute_bootstrap_variance_sample() {
-        // Variance uses 1/(B−1) (sample variance with Bessel correction)
-        // to match Python reference `np.std(..., ddof=1)`.
+        // Variance uses 1/(B−1) (Bessel-corrected sample variance); paper
+        // Algorithm 3 uses 1/B (population variance).  This test pins the
+        // Bessel denominator so a future refactor cannot silently switch
+        // to 1/B without updating the documentation.
         let estimates = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let (mean, variance, se) = compute_bootstrap_variance(&estimates);
+        let (mean, variance, se) = compute_bootstrap_variance(&estimates, 1);
 
         // Mean should be 3.0
         assert!((mean - 3.0).abs() < 1e-10);
@@ -865,7 +1284,7 @@ mod tests {
     #[test]
     fn test_compute_bootstrap_variance_empty() {
         let estimates: Vec<f64> = vec![];
-        let (mean, variance, se) = compute_bootstrap_variance(&estimates);
+        let (mean, variance, se) = compute_bootstrap_variance(&estimates, 1);
 
         assert_eq!(mean, 0.0);
         assert_eq!(variance, 0.0);
@@ -875,7 +1294,7 @@ mod tests {
     #[test]
     fn test_compute_bootstrap_variance_single() {
         let estimates = vec![5.0];
-        let (mean, variance, se) = compute_bootstrap_variance(&estimates);
+        let (mean, variance, se) = compute_bootstrap_variance(&estimates, 1);
 
         // Single value -> mean = that value, variance/se = 0
         assert_eq!(mean, 5.0);
@@ -960,10 +1379,10 @@ mod tests {
     #[test]
     fn test_compute_bootstrap_variance_with_nan() {
         let estimates = vec![1.0, 2.0, f64::NAN, 3.0, 4.0, 5.0];
-        let (mean, variance, se) = compute_bootstrap_variance(&estimates);
+        let (mean, variance, se) = compute_bootstrap_variance(&estimates, 1);
 
         let clean = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let (mean_clean, var_clean, se_clean) = compute_bootstrap_variance(&clean);
+        let (mean_clean, var_clean, se_clean) = compute_bootstrap_variance(&clean, 1);
 
         assert!((mean - mean_clean).abs() < 1e-12);
         assert!((variance - var_clean).abs() < 1e-12);
@@ -987,8 +1406,10 @@ mod tests {
 
     #[test]
     fn test_bessel_correction_matches_python() {
-        // Verify our function uses 1/(B-1) (Bessel), matching Python 3.1.1
-        // `np.std(..., ddof=1)`.
+        // Verify our function uses 1/(B-1) (Bessel-corrected sample
+        // variance) rather than 1/B (paper Algorithm 3's population
+        // variance).  The test name is historical; the assertion pins the
+        // Bessel denominator.
         let estimates = [1.0, 2.0, 3.0, 4.0, 5.0];
         let n = estimates.len() as f64;
         let mean = estimates.iter().sum::<f64>() / n;
@@ -999,9 +1420,13 @@ mod tests {
         // Bessel-corrected variance (1/(B-1)) -- current behavior.
         let variance_bessel = estimates.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
 
-        // Our function should match Bessel-corrected variance.
-        let (_, variance_func, _) = compute_bootstrap_variance(&estimates.to_vec());
+        // Our function should match Bessel-corrected variance when ddof = 1.
+        let (_, variance_func, _) = compute_bootstrap_variance(&estimates.to_vec(), 1);
         assert!((variance_func - variance_bessel).abs() < 1e-10);
+
+        // And should match the population variance when ddof = 0 (paper Alg 3).
+        let (_, variance_pop_func, _) = compute_bootstrap_variance(&estimates.to_vec(), 0);
+        assert!((variance_pop_func - variance_population).abs() < 1e-10);
 
         // And should NOT match the population variance.
         assert!((variance_func - variance_population).abs() > 1e-3);
@@ -1025,7 +1450,7 @@ mod tests {
         ];
 
         for estimates in test_cases {
-            let (_, variance, se) = compute_bootstrap_variance(&estimates);
+            let (_, variance, se) = compute_bootstrap_variance(&estimates, 1);
 
             // SE must be non-negative
             assert!(
@@ -1056,7 +1481,7 @@ mod tests {
     fn test_ci_reasonableness() {
         // Test with sorted estimates for predictable CI
         let estimates: Vec<f64> = (1..=100).map(|x| x as f64).collect();
-        let (mean, _, _) = compute_bootstrap_variance(&estimates);
+        let (mean, _, _) = compute_bootstrap_variance(&estimates, 1);
         let (ci_lower, ci_upper) = compute_percentile_ci(&estimates, 0.05);
 
         // CI bounds should be ordered correctly
@@ -1203,7 +1628,7 @@ mod tests {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(42);
         let estimates: Vec<f64> = (0..n_samples).map(|_| rng.gen_range(0.0..12.0)).collect();
 
-        let (_, variance, se) = compute_bootstrap_variance(&estimates);
+        let (_, variance, se) = compute_bootstrap_variance(&estimates, 1);
 
         // Theoretical variance for uniform [0, 12] is 12
         let theoretical_variance: f64 = 12.0;
@@ -1247,7 +1672,7 @@ mod tests {
         let se_manual = variance_manual.sqrt();
 
         // Function calculation
-        let (mean_func, variance_func, se_func) = compute_bootstrap_variance(&estimates);
+        let (mean_func, variance_func, se_func) = compute_bootstrap_variance(&estimates, 1);
 
         // Verify with high precision (< 1e-12)
         assert!(
@@ -1317,7 +1742,7 @@ mod tests {
     fn test_compute_bootstrap_variance_filters_nan() {
         // NaN values should be filtered before computing statistics
         let estimates = vec![1.0, 2.0, f64::NAN, 4.0, 5.0];
-        let (mean, variance, se) = compute_bootstrap_variance(&estimates);
+        let (mean, variance, se) = compute_bootstrap_variance(&estimates, 1);
 
         // Should compute stats from [1.0, 2.0, 4.0, 5.0] only
         assert!(mean.is_finite(), "Mean should be finite after NaN filtering");
@@ -1330,7 +1755,7 @@ mod tests {
     fn test_compute_bootstrap_variance_filters_inf() {
         // Inf values should be filtered before computing statistics
         let estimates = vec![1.0, 2.0, f64::INFINITY, 4.0, f64::NEG_INFINITY];
-        let (mean, variance, se) = compute_bootstrap_variance(&estimates);
+        let (mean, variance, se) = compute_bootstrap_variance(&estimates, 1);
 
         // Should compute stats from [1.0, 2.0, 4.0] only
         assert!(mean.is_finite(), "Mean should be finite after Inf filtering");
@@ -1344,7 +1769,7 @@ mod tests {
     fn test_compute_bootstrap_variance_all_nan() {
         // All NaN → treated as empty
         let estimates = vec![f64::NAN, f64::NAN, f64::NAN];
-        let (mean, variance, se) = compute_bootstrap_variance(&estimates);
+        let (mean, variance, se) = compute_bootstrap_variance(&estimates, 1);
         assert_eq!(mean, 0.0);
         assert_eq!(variance, 0.0);
         assert_eq!(se, 0.0);
@@ -1367,5 +1792,171 @@ mod tests {
         let (ci_lower, ci_upper) = compute_percentile_ci(&estimates, 0.05);
         assert!(ci_lower.is_nan());
         assert!(ci_upper.is_nan());
+    }
+
+    // ------------------------------------------------------------------
+    // aggregate_att: direct unit tests on the weighted aggregation helper.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_aggregate_att_unweighted_matches_mean() {
+        let pairs = vec![(1.0_f64, 0_usize), (2.0, 1), (3.0, 2), (4.0, 3)];
+        let got = aggregate_att(&pairs, None).unwrap();
+        assert!((got - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_aggregate_att_equal_weights_match_unweighted() {
+        // Equal pweights must recover the unweighted mean exactly.
+        let pairs = vec![(1.0_f64, 0_usize), (2.0, 1), (3.0, 2), (4.0, 3)];
+        let w = vec![1.0, 1.0, 1.0, 1.0];
+        let got_w = aggregate_att(&pairs, Some(&w)).unwrap();
+        let got_u = aggregate_att(&pairs, None).unwrap();
+        assert!((got_w - got_u).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_aggregate_att_weighted_hand_computation() {
+        // Weighted mean: (2*1.0 + 3*3.0) / (2 + 3) = (2 + 9)/5 = 2.2
+        let pairs = vec![(1.0_f64, 0_usize), (3.0, 1)];
+        let w = vec![2.0, 3.0];
+        let got = aggregate_att(&pairs, Some(&w)).unwrap();
+        assert!((got - 2.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_aggregate_att_nonpositive_weights_are_skipped() {
+        // Zero / negative / NaN weights must be excluded from both
+        // numerator and denominator.  Remaining cells carry full mass.
+        let pairs = vec![(1.0_f64, 0_usize), (5.0, 1), (10.0, 2)];
+        let w = vec![0.0, -1.0, 4.0];
+        let got = aggregate_att(&pairs, Some(&w)).unwrap();
+        assert!((got - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_aggregate_att_all_zero_weights_returns_none() {
+        let pairs = vec![(1.0_f64, 0_usize), (2.0, 1)];
+        let w = vec![0.0, 0.0];
+        assert!(aggregate_att(&pairs, Some(&w)).is_none());
+    }
+
+    #[test]
+    fn test_aggregate_att_empty_returns_none() {
+        let pairs: Vec<(f64, usize)> = Vec::new();
+        assert!(aggregate_att(&pairs, None).is_none());
+        let w = vec![1.0, 2.0];
+        assert!(aggregate_att(&pairs, Some(&w)).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Integration-style checks against the full bootstrap pipeline.
+    // ------------------------------------------------------------------
+
+    /// Build a tiny synthetic panel with a DID-style treatment schedule.
+    /// Returns (Y, D, control_mask, time_dist) suitable for the twostep
+    /// bootstrap entry points.
+    fn build_tiny_panel(
+        n_periods: usize,
+        n_control: usize,
+        n_treated: usize,
+        first_treated_period: usize,
+        seed: u64,
+    ) -> (Array2<f64>, Array2<f64>, Array2<u8>, ndarray::Array2<i64>) {
+        use rand::SeedableRng;
+        use rand::distributions::{Distribution, Uniform};
+        use rand_xoshiro::Xoshiro256PlusPlus;
+
+        let n_units = n_control + n_treated;
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+        let dist = Uniform::new(-0.5_f64, 0.5);
+
+        let mut y = Array2::<f64>::zeros((n_periods, n_units));
+        let mut d = Array2::<f64>::zeros((n_periods, n_units));
+        let mut cm = Array2::<u8>::zeros((n_periods, n_units));
+
+        for i in 0..n_units {
+            let alpha = (i as f64) * 0.1;
+            for t in 0..n_periods {
+                let beta = (t as f64) * 0.05;
+                let noise = dist.sample(&mut rng);
+                let treated =
+                    (i >= n_control) && (t >= first_treated_period);
+                let tau = if treated { 1.0 } else { 0.0 };
+                y[[t, i]] = alpha + beta + tau + noise;
+                d[[t, i]] = if treated { 1.0 } else { 0.0 };
+                cm[[t, i]] = if treated { 0 } else { 1 };
+            }
+        }
+
+        let mut time_dist = ndarray::Array2::<i64>::zeros((n_periods, n_periods));
+        for t1 in 0..n_periods {
+            for t2 in 0..n_periods {
+                time_dist[[t1, t2]] = (t1 as i64 - t2 as i64).abs();
+            }
+        }
+
+        (y, d, cm, time_dist)
+    }
+
+    /// Equal pweights must reproduce the unweighted bootstrap estimates
+    /// pointwise: same seed + same sampling path + weighted mean with
+    /// uniform weights == arithmetic mean.
+    #[test]
+    fn test_bootstrap_full_weighted_equal_weights_match_unweighted() {
+        let (y, d, cm, td) = build_tiny_panel(8, 6, 3, 5, 42);
+        let n_units = y.ncols();
+
+        let n_boot = 15;
+        let seed = 7;
+
+        let unweighted = bootstrap_trop_variance_full(
+            &y.view(),
+            &d.view(),
+            &cm.view(),
+            &td.view(),
+            0.5,
+            1.0,
+            0.1,
+            n_boot,
+            50,
+            1e-6,
+            seed,
+            0.05,
+            1,
+        );
+
+        let weights = vec![1.0_f64; n_units];
+        let weighted = bootstrap_trop_variance_full_weighted(
+            &y.view(),
+            &d.view(),
+            &cm.view(),
+            &td.view(),
+            0.5,
+            1.0,
+            0.1,
+            n_boot,
+            50,
+            1e-6,
+            seed,
+            0.05,
+            1,
+            &weights,
+        );
+
+        assert_eq!(unweighted.estimates.len(), weighted.estimates.len());
+        for (u, w) in unweighted
+            .estimates
+            .iter()
+            .zip(weighted.estimates.iter())
+        {
+            assert!(
+                (u - w).abs() < 1e-10,
+                "equal-weight bootstrap must match unweighted pointwise: {} vs {}",
+                u,
+                w
+            );
+        }
+        assert!((unweighted.se - weighted.se).abs() < 1e-12);
     }
 }

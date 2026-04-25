@@ -246,6 +246,14 @@ void trop_prepare_options(
     max_iter      maximum iterations per replicate
     tol           convergence tolerance per replicate
 
+  Optional argument
+    ddof          variance denominator selector forwarded to the plugin:
+                  1 = sample variance 1/(B-1) (default);
+                  0 = paper Algorithm 3 population variance 1/B.
+                  Any other value collapses to 1.  When omitted the scalar
+                  __trop_bs_ddof is left unset and the plugin applies its
+                  own default (1), preserving pre-existing call sites.
+
   Pre-allocated matrix
     __trop_bootstrap_estimates   n_bootstrap x 1, initialised to missing
 ──────────────────────────────────────────────────────────────────────────────*/
@@ -258,9 +266,12 @@ void trop_prepare_bootstrap(
     real scalar lambda_unit,
     real scalar lambda_nn,
     real scalar max_iter,
-    real scalar tol
+    real scalar tol,
+    | real scalar ddof
 )
 {
+    real scalar ddof_eff
+
     st_numscalar("__trop_n_bootstrap", n_bootstrap)
     /* Named __trop_bs_alpha to avoid collision with the unit-fixed-effects
        matrix __trop_alpha. */
@@ -274,7 +285,100 @@ void trop_prepare_bootstrap(
     st_numscalar("__trop_max_iter", max_iter)
     st_numscalar("__trop_tol", tol)
 
+    if (args() >= 9 & ddof < .) {
+        /* Clamp to {0, 1}; any other value collapses to 1. */
+        ddof_eff = (ddof == 0) ? 0 : 1
+        st_numscalar("__trop_bs_ddof", ddof_eff)
+    }
+
     st_matrix("__trop_bootstrap_estimates", J(n_bootstrap, 1, .))
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  trop_prepare_pweights()
+
+  Extracts a strictly positive, constant-within-unit pweight vector from a
+  Stata variable and stores the resulting N x 1 column of per-unit weights
+  in the matrix __trop_unit_weights.  Also sets __trop_use_weights = 1 so
+  the plugin dispatches to the weighted Rust ABI.
+
+  Arguments
+    weight_var       name of the pweight variable
+    panel_idx_var    unit identifier (1..N) after egen group
+    touse_var        estimation-sample marker
+    n_units          number of units (N)
+
+  Returns
+    0 on success; nonzero Stata return code on validation failure:
+      198 if any weight is missing, non-positive, or non-finite
+      198 if pweight is not constant within a unit
+
+  Side effects
+    __trop_unit_weights  (N x 1 matrix)
+    __trop_use_weights   = 1
+──────────────────────────────────────────────────────────────────────────────*/
+
+real scalar trop_prepare_pweights(
+    string scalar weight_var,
+    string scalar panel_idx_var,
+    string scalar touse_var,
+    real scalar n_units
+)
+{
+    real colvector panel_idx, w_obs, w_unit, seen
+    real scalar i, idx, wi
+
+    panel_idx = st_data(., panel_idx_var, touse_var)
+    w_obs     = st_data(., weight_var,    touse_var)
+
+    if (rows(panel_idx) != rows(w_obs)) {
+        errprintf("pweight (%s) and panel index lengths differ\n", weight_var)
+        return(459)
+    }
+
+    /* Any missing / non-positive pweight cell is a hard error. */
+    for (i = 1; i <= rows(w_obs); i++) {
+        wi = w_obs[i]
+        if (wi >= . | wi <= 0) {
+            errprintf("pweight %s must be strictly positive; found %g at obs %g\n",
+                      weight_var, wi, i)
+            return(459)
+        }
+    }
+
+    /* Collect the first-seen weight per unit, then enforce that every
+       subsequent observation in the unit reports the same value. */
+    w_unit = J(n_units, 1, .)
+    seen   = J(n_units, 1, 0)
+
+    for (i = 1; i <= rows(w_obs); i++) {
+        idx = panel_idx[i]
+        if (idx < 1 | idx > n_units) {
+            errprintf("panel index %g out of range [1, %g]\n", idx, n_units)
+            return(459)
+        }
+        if (!seen[idx]) {
+            w_unit[idx] = w_obs[i]
+            seen[idx]   = 1
+        }
+        else if (reldif(w_unit[idx], w_obs[i]) > 1e-12) {
+            errprintf("pweight %s is not constant within unit %g (found %g and %g)\n",
+                      weight_var, idx, w_unit[idx], w_obs[i])
+            return(459)
+        }
+    }
+
+    /* Units absent from the touse sample receive 0; the Rust aggregator
+       ignores non-positive weights, so this is safe. */
+    for (i = 1; i <= n_units; i++) {
+        if (!seen[i]) w_unit[i] = 0
+    }
+
+    st_matrix("__trop_unit_weights", w_unit)
+    st_numscalar("__trop_use_weights", 1)
+    st_global("__trop_weight_var", weight_var)
+
+    return(0)
 }
 
 /*──────────────────────────────────────────────────────────────────────────────

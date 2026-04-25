@@ -122,6 +122,145 @@ pub unsafe extern "C" fn stata_loocv_grid_search(
     n_attempted_out: *mut i32,
     first_failed_t_out: *mut i32,
     first_failed_i_out: *mut i32,
+    stage1_lambda_time_out: *mut f64,
+    stage1_lambda_unit_out: *mut f64,
+    stage1_lambda_nn_out: *mut f64,
+) -> i32 {
+    catch_panic!({
+        if y_ptr.is_null()
+            || d_ptr.is_null()
+            || control_mask_ptr.is_null()
+            || time_dist_ptr.is_null()
+            || lambda_time_grid_ptr.is_null()
+            || lambda_unit_grid_ptr.is_null()
+            || lambda_nn_grid_ptr.is_null()
+            || best_lambda_time_out.is_null()
+            || best_lambda_unit_out.is_null()
+            || best_lambda_nn_out.is_null()
+            || best_score_out.is_null()
+        {
+            return TropError::NullPointer.code();
+        }
+
+        let np = n_periods as usize;
+        let nu = n_units as usize;
+
+        let y = ptr_to_array2(y_ptr, np, nu);
+        let d = ptr_to_array2(d_ptr, np, nu);
+        let control_mask = ptr_to_array2_u8(control_mask_ptr, np, nu);
+        let time_dist = ptr_to_array2_i64(time_dist_ptr, np, np);
+
+        let lambda_time_grid =
+            slice::from_raw_parts(lambda_time_grid_ptr, lambda_time_grid_len as usize);
+        let lambda_unit_grid =
+            slice::from_raw_parts(lambda_unit_grid_ptr, lambda_unit_grid_len as usize);
+        let lambda_nn_grid = slice::from_raw_parts(lambda_nn_grid_ptr, lambda_nn_grid_len as usize);
+
+        let (
+            (
+                best_time,
+                best_unit,
+                best_nn,
+                best_score,
+                n_valid,
+                n_attempted,
+                first_failed,
+            ),
+            stage1_time,
+            stage1_unit,
+            stage1_nn,
+        ) = loocv::loocv_grid_search_with_stage1(
+            &y,
+            &d,
+            &control_mask,
+            &time_dist,
+            lambda_time_grid,
+            lambda_unit_grid,
+            lambda_nn_grid,
+            max_iter as usize,
+            tol,
+        );
+
+        *best_lambda_time_out = best_time;
+        *best_lambda_unit_out = best_unit;
+        *best_lambda_nn_out = best_nn;
+        *best_score_out = best_score;
+
+        if !n_valid_out.is_null() {
+            *n_valid_out = n_valid as i32;
+        }
+        if !n_attempted_out.is_null() {
+            *n_attempted_out = n_attempted as i32;
+        }
+        if !first_failed_t_out.is_null() {
+            *first_failed_t_out = match first_failed {
+                Some((t, _)) => t as i32,
+                None => -1,
+            };
+        }
+        if !first_failed_i_out.is_null() {
+            *first_failed_i_out = match first_failed {
+                Some((_, i)) => i as i32,
+                None => -1,
+            };
+        }
+
+        // Stage-1 univariate initialisation (paper Footnote 2).  Each out
+        // pointer is independently NULL-safe so callers that do not care
+        // about Stage-1 diagnostics can pass NULL for any subset.
+        if !stage1_lambda_time_out.is_null() {
+            *stage1_lambda_time_out = stage1_time;
+        }
+        if !stage1_lambda_unit_out.is_null() {
+            *stage1_lambda_unit_out = stage1_unit;
+        }
+        if !stage1_lambda_nn_out.is_null() {
+            *stage1_lambda_nn_out = stage1_nn;
+        }
+
+        TropError::Success.code()
+    })
+}
+
+/// Exhaustive (Cartesian) LOOCV grid search for Twostep tuning parameters.
+///
+/// Evaluates every (λ_time, λ_unit, λ_nn) combination in parallel and
+/// returns the global grid minimum under the tie-breaker rules used by
+/// [`stata_loocv_grid_search`].  On small panels where the coordinate-descent
+/// (cycling) path can converge to a local minimum, the exhaustive search
+/// gives a platform- and BLAS-independent λ selection at the cost of
+/// O(|Λ_time| · |Λ_unit| · |Λ_nn|) LOOCV evaluations.
+///
+/// # Returns
+/// `0` on success; a non-zero `TropError` code otherwise.
+///
+/// # Safety
+/// All pointers must be non-null and point to properly sized buffers.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stata_loocv_grid_search_exhaustive(
+    y_ptr: *const f64,
+    d_ptr: *const f64,
+    control_mask_ptr: *const u8,
+    time_dist_ptr: *const i64,
+    n_periods: i32,
+    n_units: i32,
+    lambda_time_grid_ptr: *const f64,
+    lambda_time_grid_len: i32,
+    lambda_unit_grid_ptr: *const f64,
+    lambda_unit_grid_len: i32,
+    lambda_nn_grid_ptr: *const f64,
+    lambda_nn_grid_len: i32,
+    max_iter: i32,
+    tol: f64,
+    best_lambda_time_out: *mut f64,
+    best_lambda_unit_out: *mut f64,
+    best_lambda_nn_out: *mut f64,
+    best_score_out: *mut f64,
+    n_valid_out: *mut i32,
+    n_attempted_out: *mut i32,
+    first_failed_t_out: *mut i32,
+    first_failed_i_out: *mut i32,
 ) -> i32 {
     catch_panic!({
         if y_ptr.is_null()
@@ -161,7 +300,7 @@ pub unsafe extern "C" fn stata_loocv_grid_search(
             n_valid,
             n_attempted,
             first_failed,
-        ) = loocv::loocv_grid_search(
+        ) = loocv::loocv_grid_search_exhaustive(
             &y,
             &d,
             &control_mask,
@@ -323,6 +462,7 @@ pub unsafe extern "C" fn stata_estimate_twostep(
                     max_iter as usize,
                     tol,
                     None,
+                    None,
                 ) {
                     Some((alpha, beta, l, n_iters, did_converge)) => {
                         let tau = y[[*t, *i]] - alpha[*i] - beta[*t] - l[[*t, *i]];
@@ -435,12 +575,18 @@ pub unsafe extern "C" fn stata_estimate_twostep(
 /// in each replicate, and returns the standard error, percentile confidence
 /// interval, and the full vector of bootstrap estimates.
 ///
+/// `ddof` selects the variance denominator:
+///   - `1` (default) → Bessel-corrected sample variance `1/(B−1)`.
+///   - `0`           → paper Algorithm 3 population variance `1/B`.
+/// Any other value collapses to `1`.
+///
 /// # Returns
 /// `0` on success; a non-zero `TropError` code otherwise.
 ///
 /// # Safety
 /// All pointers must be non-null and point to properly sized buffers.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn stata_bootstrap_trop_variance(
     y_ptr: *const f64,
     d_ptr: *const f64,
@@ -456,6 +602,7 @@ pub unsafe extern "C" fn stata_bootstrap_trop_variance(
     tol: f64,
     seed: u64,
     alpha: f64,
+    ddof: i32,
     estimates_ptr: *mut f64,
     se_out: *mut f64,
     ci_lower_out: *mut f64,
@@ -486,6 +633,9 @@ pub unsafe extern "C" fn stata_bootstrap_trop_variance(
             alpha
         };
 
+        // Clamp ddof into the {0, 1} set; any out-of-range value defaults to 1.
+        let ddof_u8: u8 = if ddof == 0 { 0 } else { 1 };
+
         let result = bootstrap::bootstrap_trop_variance_full(
             &y,
             &d,
@@ -499,6 +649,7 @@ pub unsafe extern "C" fn stata_bootstrap_trop_variance(
             tol,
             seed,
             alpha_eff,
+            ddof_u8,
         );
 
         *se_out = result.se;
@@ -562,6 +713,9 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
     n_attempted_out: *mut i32,
     first_failed_t_out: *mut i32,
     first_failed_i_out: *mut i32,
+    stage1_lambda_time_out: *mut f64,
+    stage1_lambda_unit_out: *mut f64,
+    stage1_lambda_nn_out: *mut f64,
 ) -> i32 {
     catch_panic!({
         if y_ptr.is_null()
@@ -585,6 +739,15 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
         let d = ptr_to_array2(d_ptr, np, nu);
         let control_mask = ptr_to_array2_u8(control_mask_ptr, np, nu);
 
+        // Defence-in-depth: the joint estimator's global weight matrix is
+        // only well-defined when treatment is simultaneously adopted.  The
+        // Stata layer already rejects staggered D, but if we arrive here
+        // with a non-conforming matrix we prefer a clean error over a
+        // silently wrong `treated_periods`.
+        if let Err(err) = loocv::check_simultaneous_adoption(&d) {
+            return err.code();
+        }
+
         let lambda_time_grid =
             slice::from_raw_parts(lambda_time_grid_ptr, lambda_time_grid_len as usize);
         let lambda_unit_grid =
@@ -592,14 +755,19 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
         let lambda_nn_grid = slice::from_raw_parts(lambda_nn_grid_ptr, lambda_nn_grid_len as usize);
 
         let (
-            best_time,
-            best_unit,
-            best_nn,
-            best_score,
-            n_valid,
-            n_attempted,
-            first_failed,
-        ) = loocv::loocv_cycling_search_joint(
+            (
+                best_time,
+                best_unit,
+                best_nn,
+                best_score,
+                n_valid,
+                n_attempted,
+                first_failed,
+            ),
+            stage1_time,
+            stage1_unit,
+            stage1_nn,
+        ) = loocv::loocv_cycling_search_joint_with_stage1(
             &y,
             &d,
             &control_mask,
@@ -635,6 +803,17 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
             };
         }
 
+        // Stage-1 univariate initialisation (paper Footnote 2).  NULL-safe.
+        if !stage1_lambda_time_out.is_null() {
+            *stage1_lambda_time_out = stage1_time;
+        }
+        if !stage1_lambda_unit_out.is_null() {
+            *stage1_lambda_unit_out = stage1_unit;
+        }
+        if !stage1_lambda_nn_out.is_null() {
+            *stage1_lambda_nn_out = stage1_nn;
+        }
+
         TropError::Success.code()
     })
 }
@@ -645,9 +824,10 @@ pub unsafe extern "C" fn stata_loocv_cycling_search_joint(
 /// Evaluates every combination in the Cartesian product of the three grids in
 /// parallel and returns the triple that minimises the LOOCV criterion Q(λ).
 /// Complexity is O(|Λ_time| · |Λ_unit| · |Λ_nn|).  Prefer this over the
-/// coordinate-descent variant when the grid is small enough to afford it, as
-/// it matches the Python reference (`diff_diff.trop_global._fit_global`,
-/// v3.1.1) exactly.
+/// coordinate-descent variant when the grid is small enough to afford it,
+/// as it returns the exact grid argmin of Q(λ) (paper Algorithm 2 step 5)
+/// rather than a coordinate-descent polish of Q(λ) on a possibly non-convex
+/// surface.
 ///
 /// The signature mirrors [`stata_loocv_cycling_search_joint`] with the sole
 /// exception that `max_cycles` is absent.
@@ -703,6 +883,12 @@ pub unsafe extern "C" fn stata_loocv_grid_search_joint(
         let y = ptr_to_array2(y_ptr, np, nu);
         let d = ptr_to_array2(d_ptr, np, nu);
         let control_mask = ptr_to_array2_u8(control_mask_ptr, np, nu);
+
+        // Defence-in-depth: joint LOOCV is only well-defined under
+        // simultaneous adoption; mirror the guard in the cycling entry.
+        if let Err(err) = loocv::check_simultaneous_adoption(&d) {
+            return err.code();
+        }
 
         let lambda_time_grid =
             slice::from_raw_parts(lambda_time_grid_ptr, lambda_time_grid_len as usize);
@@ -819,19 +1005,23 @@ pub unsafe extern "C" fn stata_estimate_joint(
             lambda_nn
         };
 
-        // Locate the earliest period containing any treated cell.
-        let mut first_treat_period = np;
-        for t in 0..np {
-            for i in 0..nu {
-                if d[[t, i]] == 1.0 {
-                    first_treat_period = first_treat_period.min(t);
-                    break;
-                }
-            }
-        }
-        let treated_periods = np.saturating_sub(first_treat_period);
+        // Joint method is only well-defined under simultaneous adoption
+        // (paper Remark 6.1).  Short-circuit with a clean error code if the
+        // upstream Stata validation was bypassed.  On success, this yields
+        // the shared `treated_periods` count used by δ.
+        let treated_periods = match loocv::check_simultaneous_adoption(&d) {
+            Ok(tp) => tp,
+            Err(err) => return err.code(),
+        };
 
         let delta = weights::compute_joint_weights(&y, &d, lt_eff, lu_eff, treated_periods);
+
+        // B.2 defensive check: compute_joint_weights always (1 − D)-masks
+        // δ, but wiring regressions at the FFI boundary are exactly what this
+        // debug_assert is designed to catch.
+        estimation::debug_assert_delta_is_1minus_d_masked(
+            &d, &delta.view(), "stata_estimate_joint/delta",
+        );
 
         // When λ_nn is large enough, skip the low-rank component entirely.
         // τ is post-hoc: mean residual over treated cells (L ≡ 0 here).
@@ -930,12 +1120,18 @@ pub unsafe extern "C" fn stata_estimate_joint(
 /// each replicate, and returns the standard error, percentile confidence
 /// interval, and the full vector of bootstrap estimates.
 ///
+/// `ddof` selects the variance denominator:
+///   - `1` (default) → Bessel-corrected sample variance `1/(B−1)`.
+///   - `0`           → paper Algorithm 3 population variance `1/B`.
+/// Any other value collapses to `1`.
+///
 /// # Returns
 /// `0` on success; a non-zero `TropError` code otherwise.
 ///
 /// # Safety
 /// All pointers must be non-null and point to properly sized buffers.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn stata_bootstrap_trop_variance_joint(
     y_ptr: *const f64,
     d_ptr: *const f64,
@@ -949,6 +1145,7 @@ pub unsafe extern "C" fn stata_bootstrap_trop_variance_joint(
     tol: f64,
     seed: u64,
     alpha: f64,
+    ddof: i32,
     estimates_ptr: *mut f64,
     se_out: *mut f64,
     ci_lower_out: *mut f64,
@@ -966,11 +1163,20 @@ pub unsafe extern "C" fn stata_bootstrap_trop_variance_joint(
         let y = ptr_to_array2(y_ptr, np, nu);
         let d = ptr_to_array2(d_ptr, np, nu);
 
+        // Joint bootstrap requires simultaneous adoption (each replicate calls
+        // compute_joint_weights internally).  Short-circuit on violation.
+        if let Err(err) = loocv::check_simultaneous_adoption(&d) {
+            return err.code();
+        }
+
         let alpha_eff = if alpha <= 0.0 || alpha >= 1.0 {
             0.05
         } else {
             alpha
         };
+
+        // Clamp ddof into the {0, 1} set; any out-of-range value defaults to 1.
+        let ddof_u8: u8 = if ddof == 0 { 0 } else { 1 };
 
         let result = bootstrap::bootstrap_trop_variance_joint_full(
             &y,
@@ -983,6 +1189,567 @@ pub unsafe extern "C" fn stata_bootstrap_trop_variance_joint(
             tol,
             seed,
             alpha_eff,
+            ddof_u8,
+        );
+
+        *se_out = result.se;
+
+        if !ci_lower_out.is_null() {
+            *ci_lower_out = result.ci_lower;
+        }
+        if !ci_upper_out.is_null() {
+            *ci_upper_out = result.ci_upper;
+        }
+        if !n_valid_out.is_null() {
+            *n_valid_out = result.n_valid as i32;
+        }
+
+        if !estimates_ptr.is_null() {
+            let est_slice = slice::from_raw_parts_mut(estimates_ptr, result.estimates.len());
+            est_slice.copy_from_slice(&result.estimates);
+        }
+
+        TropError::Success.code()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// pweight-aware variants — C ABI exports
+//
+// These variants accept a non-null pointer `unit_weights_ptr` of length
+// `n_units` with strictly positive pweights (validated by the caller) and
+// aggregate the ATT as τ̂ = Σ w_i τ_{t,i} / Σ w_i.  Per-cell estimation and
+// pre/post-hoc parameters remain unchanged — pweight enters only the
+// aggregation step, matching the pweight-only (no strata/PSU/FPC) survey
+// design used by the reference Python implementation.
+// ---------------------------------------------------------------------------
+
+/// Twostep point estimation with per-unit pweights.
+///
+/// Same as [`stata_estimate_twostep`] but aggregates the per-cell τ as the
+/// weighted mean `τ̂ = Σ w_i τ_{t,i} / Σ w_i`.  The parameters (α, β, L)
+/// are averaged unweighted across treated observations (unchanged).
+///
+/// # Arguments
+/// All of [`stata_estimate_twostep`] plus `unit_weights_ptr` of length
+/// `n_units`.  Weights are indexed by the original panel column order and
+/// must be strictly positive (validated by the caller).
+///
+/// # Returns
+/// `0` on success; a non-zero `TropError` code otherwise.
+///
+/// # Safety
+/// All pointers must be non-null and point to properly sized buffers.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stata_estimate_twostep_weighted(
+    y_ptr: *const f64,
+    d_ptr: *const f64,
+    control_mask_ptr: *const u8,
+    time_dist_ptr: *const i64,
+    n_periods: i32,
+    n_units: i32,
+    lambda_time: f64,
+    lambda_unit: f64,
+    lambda_nn: f64,
+    max_iter: i32,
+    tol: f64,
+    att_out: *mut f64,
+    tau_ptr: *mut f64,
+    alpha_ptr: *mut f64,
+    beta_ptr: *mut f64,
+    l_ptr: *mut f64,
+    n_treated_out: *mut i32,
+    n_iterations_out: *mut i32,
+    converged_out: *mut i32,
+    converged_by_obs_ptr: *mut i32,
+    n_iters_by_obs_ptr: *mut i32,
+    unit_weights_ptr: *const f64,
+) -> i32 {
+    catch_panic!({
+        if y_ptr.is_null()
+            || d_ptr.is_null()
+            || control_mask_ptr.is_null()
+            || time_dist_ptr.is_null()
+            || att_out.is_null()
+            || unit_weights_ptr.is_null()
+        {
+            return TropError::NullPointer.code();
+        }
+
+        let np = n_periods as usize;
+        let nu = n_units as usize;
+
+        let y = ptr_to_array2(y_ptr, np, nu);
+        let d = ptr_to_array2(d_ptr, np, nu);
+        let control_mask = ptr_to_array2_u8(control_mask_ptr, np, nu);
+        let time_dist = ptr_to_array2_i64(time_dist_ptr, np, np);
+        let unit_weights = slice::from_raw_parts(unit_weights_ptr, nu);
+
+        let mut treated_obs: Vec<(usize, usize)> = Vec::new();
+        for t in 0..np {
+            for i in 0..nu {
+                if d[[t, i]] == 1.0 {
+                    treated_obs.push((t, i));
+                }
+            }
+        }
+
+        if treated_obs.is_empty() {
+            return TropError::NoTreated.code();
+        }
+
+        let lt_eff = if lambda_time.is_infinite() { 0.0 } else { lambda_time };
+        let lu_eff = if lambda_unit.is_infinite() { 0.0 } else { lambda_unit };
+        let ln_eff = if lambda_nn.is_infinite() { 1e10 } else { lambda_nn };
+
+        struct ObsResult {
+            tau: f64,
+            alpha: Array1<f64>,
+            beta: Array1<f64>,
+            l: Array2<f64>,
+            n_iters: usize,
+            converged: bool,
+        }
+
+        let dist_cache = distance::UnitDistanceCache::build(&y, &d);
+
+        let obs_results: Vec<Option<ObsResult>> = treated_obs
+            .par_iter()
+            .map(|(t, i)| {
+                let weight_matrix = weights::compute_weight_matrix_cached(
+                    &y, &d, &dist_cache, np, nu, *i, *t, lt_eff, lu_eff, &time_dist,
+                );
+
+                match estimation::estimate_model(
+                    &y,
+                    &control_mask,
+                    &weight_matrix.view(),
+                    ln_eff,
+                    np,
+                    nu,
+                    max_iter as usize,
+                    tol,
+                    None,
+                    None,
+                ) {
+                    Some((alpha, beta, l, n_iters, did_converge)) => {
+                        let tau = y[[*t, *i]] - alpha[*i] - beta[*t] - l[[*t, *i]];
+                        Some(ObsResult {
+                            tau,
+                            alpha,
+                            beta,
+                            l,
+                            n_iters,
+                            converged: did_converge,
+                        })
+                    }
+                    None => None,
+                }
+            })
+            .collect();
+
+        // Collect (tau, unit_index) pairs for weighted aggregation; aggregate
+        // (α, β, L) with an unweighted mean (unchanged vs. unweighted path).
+        let mut tau_values: Vec<f64> = Vec::with_capacity(treated_obs.len());
+        let mut tau_units: Vec<usize> = Vec::with_capacity(treated_obs.len());
+        let mut alpha_sum = Array1::<f64>::zeros(nu);
+        let mut beta_sum = Array1::<f64>::zeros(np);
+        let mut l_sum = Array2::<f64>::zeros((np, nu));
+        let mut n_successful: usize = 0;
+        let mut max_iters: usize = 0;
+        let mut all_successful_converged = true;
+        let mut converged_by_obs: Vec<i32> = Vec::with_capacity(treated_obs.len());
+        let mut n_iters_by_obs: Vec<i32> = Vec::with_capacity(treated_obs.len());
+
+        for ((_t, i), result) in treated_obs.iter().zip(obs_results.into_iter()) {
+            match result {
+                Some(obs) => {
+                    tau_values.push(obs.tau);
+                    tau_units.push(*i);
+                    alpha_sum += &obs.alpha;
+                    beta_sum += &obs.beta;
+                    l_sum += &obs.l;
+                    n_successful += 1;
+                    if obs.n_iters > max_iters {
+                        max_iters = obs.n_iters;
+                    }
+                    if !obs.converged {
+                        all_successful_converged = false;
+                    }
+                    converged_by_obs.push(if obs.converged { 1 } else { 0 });
+                    n_iters_by_obs.push(obs.n_iters as i32);
+                }
+                None => {
+                    converged_by_obs.push(-1);
+                    n_iters_by_obs.push(-1);
+                }
+            }
+        }
+
+        if tau_values.is_empty() {
+            return TropError::Convergence.code();
+        }
+
+        // Weighted ATT: τ̂ = Σ w_i τ_{t,i} / Σ w_i.
+        let mut num = 0.0_f64;
+        let mut den = 0.0_f64;
+        for (tau_val, unit_idx) in tau_values.iter().zip(tau_units.iter()) {
+            let wi = unit_weights[*unit_idx];
+            if !wi.is_finite() || wi <= 0.0 {
+                continue;
+            }
+            num += wi * tau_val;
+            den += wi;
+        }
+        let att = if den > 0.0 { num / den } else { return TropError::Convergence.code(); };
+
+        let n_succ_f64 = n_successful as f64;
+        let all_alpha = alpha_sum / n_succ_f64;
+        let all_beta = beta_sum / n_succ_f64;
+        let all_l = l_sum / n_succ_f64;
+
+        *att_out = att;
+        *n_treated_out = tau_values.len() as i32;
+        *n_iterations_out = max_iters as i32;
+        *converged_out = if all_successful_converged { 1 } else { 0 };
+
+        if !converged_by_obs_ptr.is_null() {
+            let slot = slice::from_raw_parts_mut(converged_by_obs_ptr, converged_by_obs.len());
+            slot.copy_from_slice(&converged_by_obs);
+        }
+        if !n_iters_by_obs_ptr.is_null() {
+            let slot = slice::from_raw_parts_mut(n_iters_by_obs_ptr, n_iters_by_obs.len());
+            slot.copy_from_slice(&n_iters_by_obs);
+        }
+
+        if !tau_ptr.is_null() {
+            let tau_slice = slice::from_raw_parts_mut(tau_ptr, tau_values.len());
+            tau_slice.copy_from_slice(&tau_values);
+        }
+
+        if !alpha_ptr.is_null() {
+            let alpha_slice = slice::from_raw_parts_mut(alpha_ptr, nu);
+            alpha_slice.copy_from_slice(all_alpha.as_slice().unwrap());
+        }
+
+        if !beta_ptr.is_null() {
+            let beta_slice = slice::from_raw_parts_mut(beta_ptr, np);
+            beta_slice.copy_from_slice(all_beta.as_slice().unwrap());
+        }
+
+        if !l_ptr.is_null() {
+            array2_to_ptr(&all_l, l_ptr);
+        }
+
+        TropError::Success.code()
+    })
+}
+
+/// Twostep bootstrap with per-unit pweights.
+///
+/// Same as [`stata_bootstrap_trop_variance`] but aggregates the bootstrap
+/// ATT as `τ̂_b = Σ w_i τ_{t,i} / Σ w_i`, where each resampled column
+/// inherits the pweight of the original unit it represents.
+///
+/// # Safety
+/// All pointers must be non-null and point to properly sized buffers.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stata_bootstrap_trop_variance_weighted(
+    y_ptr: *const f64,
+    d_ptr: *const f64,
+    control_mask_ptr: *const u8,
+    time_dist_ptr: *const i64,
+    n_periods: i32,
+    n_units: i32,
+    lambda_time: f64,
+    lambda_unit: f64,
+    lambda_nn: f64,
+    n_bootstrap: i32,
+    max_iter: i32,
+    tol: f64,
+    seed: u64,
+    alpha: f64,
+    ddof: i32,
+    estimates_ptr: *mut f64,
+    se_out: *mut f64,
+    ci_lower_out: *mut f64,
+    ci_upper_out: *mut f64,
+    n_valid_out: *mut i32,
+    unit_weights_ptr: *const f64,
+) -> i32 {
+    catch_panic!({
+        if y_ptr.is_null()
+            || d_ptr.is_null()
+            || control_mask_ptr.is_null()
+            || time_dist_ptr.is_null()
+            || se_out.is_null()
+            || unit_weights_ptr.is_null()
+        {
+            return TropError::NullPointer.code();
+        }
+
+        let np = n_periods as usize;
+        let nu = n_units as usize;
+
+        let y = ptr_to_array2(y_ptr, np, nu);
+        let d = ptr_to_array2(d_ptr, np, nu);
+        let control_mask = ptr_to_array2_u8(control_mask_ptr, np, nu);
+        let time_dist = ptr_to_array2_i64(time_dist_ptr, np, np);
+        let unit_weights = slice::from_raw_parts(unit_weights_ptr, nu);
+
+        let alpha_eff = if alpha <= 0.0 || alpha >= 1.0 { 0.05 } else { alpha };
+        let ddof_u8: u8 = if ddof == 0 { 0 } else { 1 };
+
+        let result = bootstrap::bootstrap_trop_variance_full_weighted(
+            &y,
+            &d,
+            &control_mask,
+            &time_dist,
+            lambda_time,
+            lambda_unit,
+            lambda_nn,
+            n_bootstrap as usize,
+            max_iter as usize,
+            tol,
+            seed,
+            alpha_eff,
+            ddof_u8,
+            unit_weights,
+        );
+
+        *se_out = result.se;
+
+        if !ci_lower_out.is_null() {
+            *ci_lower_out = result.ci_lower;
+        }
+        if !ci_upper_out.is_null() {
+            *ci_upper_out = result.ci_upper;
+        }
+        if !n_valid_out.is_null() {
+            *n_valid_out = result.n_valid as i32;
+        }
+
+        if !estimates_ptr.is_null() {
+            let est_slice = slice::from_raw_parts_mut(estimates_ptr, result.estimates.len());
+            est_slice.copy_from_slice(&result.estimates);
+        }
+
+        TropError::Success.code()
+    })
+}
+
+/// Joint point estimation with per-unit pweights.
+///
+/// Same as [`stata_estimate_joint`] but aggregates the post-hoc τ as the
+/// weighted mean `τ̂ = Σ w_i (Y_{t,i} − μ − α_i − β_t − L_{t,i}) / Σ w_i`.
+/// The joint estimation of (μ, α, β, L) is unchanged.
+///
+/// # Safety
+/// All pointers must be non-null and point to properly sized buffers.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stata_estimate_joint_weighted(
+    y_ptr: *const f64,
+    d_ptr: *const f64,
+    n_periods: i32,
+    n_units: i32,
+    lambda_time: f64,
+    lambda_unit: f64,
+    lambda_nn: f64,
+    max_iter: i32,
+    tol: f64,
+    tau_out: *mut f64,
+    mu_out: *mut f64,
+    alpha_ptr: *mut f64,
+    beta_ptr: *mut f64,
+    l_ptr: *mut f64,
+    n_iterations_out: *mut i32,
+    converged_out: *mut i32,
+    tau_vec_ptr: *mut f64,
+    n_treated_out: *mut i32,
+    unit_weights_ptr: *const f64,
+) -> i32 {
+    catch_panic!({
+        if y_ptr.is_null()
+            || d_ptr.is_null()
+            || tau_out.is_null()
+            || mu_out.is_null()
+            || unit_weights_ptr.is_null()
+        {
+            return TropError::NullPointer.code();
+        }
+
+        let np = n_periods as usize;
+        let nu = n_units as usize;
+
+        let y = ptr_to_array2(y_ptr, np, nu);
+        let d = ptr_to_array2(d_ptr, np, nu);
+        let unit_weights = slice::from_raw_parts(unit_weights_ptr, nu);
+
+        let lt_eff = if lambda_time.is_infinite() { 0.0 } else { lambda_time };
+        let lu_eff = if lambda_unit.is_infinite() { 0.0 } else { lambda_unit };
+        let ln_eff = if lambda_nn.is_infinite() { 1e10 } else { lambda_nn };
+
+        // Joint method requires simultaneous adoption; see stata_estimate_joint.
+        let treated_periods = match loocv::check_simultaneous_adoption(&d) {
+            Ok(tp) => tp,
+            Err(err) => return err.code(),
+        };
+
+        let delta = weights::compute_joint_weights(&y, &d, lt_eff, lu_eff, treated_periods);
+
+        estimation::debug_assert_delta_is_1minus_d_masked(
+            &d, &delta.view(), "stata_estimate_joint_weighted/delta",
+        );
+
+        // Joint WLS produces (μ, α, β, L).  We then compute the weighted ATT
+        // post-hoc instead of the unweighted mean returned by the unweighted
+        // path.
+        let fit = if ln_eff >= 1e10 {
+            estimation::solve_joint_no_lowrank(&y, &delta.view()).map(
+                |(mu, alpha, beta)| {
+                    let l = Array2::<f64>::zeros((np, nu));
+                    (mu, alpha, beta, l, 1_usize, true)
+                },
+            )
+        } else {
+            estimation::solve_joint_with_lowrank(
+                &y,
+                &d,
+                &delta.view(),
+                ln_eff,
+                max_iter as usize,
+                tol,
+            )
+            .map(|(mu, alpha, beta, l, _tau, n_iters, did_converge)| {
+                (mu, alpha, beta, l, n_iters, did_converge)
+            })
+        };
+
+        match fit {
+            Some((mu, alpha, beta, l, n_iters, did_converge)) => {
+                // Weighted post-hoc ATT + per-cell τ vector.
+                let mut tau_values: Vec<f64> = Vec::new();
+                let mut num = 0.0_f64;
+                let mut den = 0.0_f64;
+                for t in 0..np {
+                    for i in 0..nu {
+                        if d[[t, i]] == 1.0 && y[[t, i]].is_finite() {
+                            let tau_cell =
+                                y[[t, i]] - mu - alpha[i] - beta[t] - l[[t, i]];
+                            tau_values.push(tau_cell);
+                            let wi = unit_weights[i];
+                            if wi.is_finite() && wi > 0.0 {
+                                num += wi * tau_cell;
+                                den += wi;
+                            }
+                        }
+                    }
+                }
+                let tau_scalar = if den > 0.0 { num / den } else { f64::NAN };
+
+                *tau_out = tau_scalar;
+                *mu_out = mu;
+                *n_iterations_out = n_iters as i32;
+                *converged_out = if did_converge { 1 } else { 0 };
+
+                if !alpha_ptr.is_null() {
+                    let alpha_slice = slice::from_raw_parts_mut(alpha_ptr, nu);
+                    alpha_slice.copy_from_slice(alpha.as_slice().unwrap());
+                }
+                if !beta_ptr.is_null() {
+                    let beta_slice = slice::from_raw_parts_mut(beta_ptr, np);
+                    beta_slice.copy_from_slice(beta.as_slice().unwrap());
+                }
+                if !l_ptr.is_null() {
+                    array2_to_ptr(&l, l_ptr);
+                }
+
+                if !tau_vec_ptr.is_null() {
+                    let tau_slice = slice::from_raw_parts_mut(tau_vec_ptr, tau_values.len());
+                    tau_slice.copy_from_slice(&tau_values);
+                }
+                if !n_treated_out.is_null() {
+                    *n_treated_out = tau_values.len() as i32;
+                }
+
+                TropError::Success.code()
+            }
+            None => TropError::Convergence.code(),
+        }
+    })
+}
+
+/// Joint bootstrap with per-unit pweights.
+///
+/// Same as [`stata_bootstrap_trop_variance_joint`] but aggregates each
+/// bootstrap replicate's ATT as the weighted post-hoc mean.
+///
+/// # Safety
+/// All pointers must be non-null and point to properly sized buffers.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stata_bootstrap_trop_variance_joint_weighted(
+    y_ptr: *const f64,
+    d_ptr: *const f64,
+    n_periods: i32,
+    n_units: i32,
+    lambda_time: f64,
+    lambda_unit: f64,
+    lambda_nn: f64,
+    n_bootstrap: i32,
+    max_iter: i32,
+    tol: f64,
+    seed: u64,
+    alpha: f64,
+    ddof: i32,
+    estimates_ptr: *mut f64,
+    se_out: *mut f64,
+    ci_lower_out: *mut f64,
+    ci_upper_out: *mut f64,
+    n_valid_out: *mut i32,
+    unit_weights_ptr: *const f64,
+) -> i32 {
+    catch_panic!({
+        if y_ptr.is_null()
+            || d_ptr.is_null()
+            || se_out.is_null()
+            || unit_weights_ptr.is_null()
+        {
+            return TropError::NullPointer.code();
+        }
+
+        let np = n_periods as usize;
+        let nu = n_units as usize;
+
+        let y = ptr_to_array2(y_ptr, np, nu);
+        let d = ptr_to_array2(d_ptr, np, nu);
+        let unit_weights = slice::from_raw_parts(unit_weights_ptr, nu);
+
+        // Joint bootstrap requires simultaneous adoption; see the unweighted
+        // entry for the rationale.
+        if let Err(err) = loocv::check_simultaneous_adoption(&d) {
+            return err.code();
+        }
+
+        let alpha_eff = if alpha <= 0.0 || alpha >= 1.0 { 0.05 } else { alpha };
+        let ddof_u8: u8 = if ddof == 0 { 0 } else { 1 };
+
+        let result = bootstrap::bootstrap_trop_variance_joint_full_weighted(
+            &y,
+            &d,
+            lambda_time,
+            lambda_unit,
+            lambda_nn,
+            n_bootstrap as usize,
+            max_iter as usize,
+            tol,
+            seed,
+            alpha_eff,
+            ddof_u8,
+            unit_weights,
         );
 
         *se_out = result.se;
@@ -1157,17 +1924,12 @@ pub unsafe extern "C" fn stata_compute_joint_weight_vectors(
         let lt_eff = if lambda_time.is_infinite() { 0.0 } else { lambda_time };
         let lu_eff = if lambda_unit.is_infinite() { 0.0 } else { lambda_unit };
 
-        // Locate the earliest period containing any treated cell.
-        let mut first_treat_period = np;
-        for t in 0..np {
-            for i in 0..nu {
-                if d[[t, i]] == 1.0 {
-                    first_treat_period = first_treat_period.min(t);
-                    break;
-                }
-            }
-        }
-        let treated_periods = np.saturating_sub(first_treat_period);
+        // Joint weight construction requires simultaneous adoption; see
+        // stata_estimate_joint for the rationale.
+        let treated_periods = match loocv::check_simultaneous_adoption(&d) {
+            Ok(tp) => tp,
+            Err(err) => return err.code(),
+        };
 
         let (delta_time, delta_unit) = weights::compute_joint_weight_vectors(
             &y, &d, lt_eff, lu_eff, treated_periods,

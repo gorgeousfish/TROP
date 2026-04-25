@@ -28,8 +28,8 @@ program define trop_predict_mu
 
     if "`method'" == "twostep" {
         // twostep decomposition has no global intercept
-        di as txt "(note: mu is not identified under the twostep method; variable set to missing)"
-        label variable `varlist' "Global intercept (N/A, twostep)"
+        di as txt "(note: mu is not identified under the twostep Algorithm 2 path; variable set to missing)"
+        label variable `varlist' "Global intercept (N/A under twostep)"
     }
     else if "`method'" == "joint" {
         local mu_val = e(mu)

@@ -33,7 +33,7 @@ In semi-synthetic simulations calibrated to seven real datasets (Table 1 of the 
 - **Leave-One-Out Cross-Validation** — Data-driven selection of tuning parameters via coordinate-cycling LOOCV (Algorithm 1)
 - **Bootstrap Inference** — Stratified unit block bootstrap for variance estimation and confidence intervals (Algorithm 3)
 - **General Assignment Patterns** — Handles staggered adoption, switching treatments, and arbitrary binary treatment matrices
-- **Post-Estimation Diagnostics** — 7 `estat` subcommands and 8 `predict` types for comprehensive analysis
+- **Post-Estimation Diagnostics** — 8 `estat` subcommands (including a triple-robustness bias decomposition) and 8 `predict` types for comprehensive analysis
 - **High-Performance Backend** — Core computation in Rust via compiled plugin; no external dependencies
 
 ## Key Concepts
@@ -320,7 +320,7 @@ Treatment Effect (ATT):
 > stable to the third decimal place. For faster and fully-converged estimates,
 > either (i) increase `lambda_nn` (e.g. `fixedlambda(0.4 0.3 0.1)` converges in
 > about 110 iterations to τ = -0.006672) or (ii) relax the tolerance via
-> `tol(1e-4)`. Verified end-to-end against `diff_diff==3.1.1` (|Δτ| < 4e-7).
+> `tol(1e-4)`. The ATT matches the reference implementation to `|Δτ| < 4e-7`.
 
 **Available datasets** (download via `net get trop`):
 
@@ -399,7 +399,7 @@ Post-estimation (available after `trop`):
 
 | Command          | Description                                       |
 | ---------------- | ------------------------------------------------- |
-| `estat`          | Diagnostics dispatcher (7 subcommands; see below) |
+| `estat`          | Diagnostics dispatcher (8 subcommands; see below) |
 | `predict`        | Prediction dispatcher (8 types; see below)        |
 
 ## Options
@@ -426,6 +426,8 @@ Post-estimation (available after `trop`):
 | `tol(real)`                  | Convergence tolerance for iterative estimation                  | `1e-6`     |
 | `maxiter(integer)`           | Maximum number of iterations                                    | `100`      |
 | `bootstrap(integer)`         | Number of bootstrap replications (0 = skip inference)           | `200`      |
+| `bsvariance(string)`         | Bootstrap variance denominator: `sample` (1/(B-1)) or `paper` (1/B, Alg 3) | `sample`   |
+| `cimethod(string)`           | Primary confidence interval: `percentile` (Alg 3 step 6), `t`, or `normal` | `percentile` if `bootstrap > 0`, else `t` |
 | `seed(integer)`              | Random number generator seed                                    | `42`       |
 | `level(cilevel)`             | Confidence level for intervals                                  | `c(level)` |
 | `verbose`                    | Display detailed diagnostic output                              | off        |
@@ -438,9 +440,9 @@ Post-estimation (available after `trop`):
 - `lambda_time_grid()` and `lambda_unit_grid()` must be finite, non-negative
   numlists; Stata missing (`.`) is rejected at parse time.
 - `lambda_nn_grid()` and the third slot of `fixedlambda()` accept `.` as
-  +infinity, mirroring the `diff-diff 3.1.1` Python reference.  The default
-  grid includes this corner so LOOCV can select the "no factor structure"
-  regime (classical DID / synthetic control) when it minimises Q(λ).
+  +infinity (DID/TWFE corner, L ≡ 0).  The default grid includes this
+  corner so LOOCV can select the "no factor structure" regime (classical
+  DID / synthetic control) when it minimises Q(λ).
 
 ### trop_bootstrap Options
 
@@ -464,10 +466,24 @@ Post-estimation (available after `trop`):
 | `e(att)`        | ATT point estimate                             |
 | `e(se)`         | Bootstrap standard error                       |
 | `e(t)`          | t statistic (att/se)                           |
-| `e(pvalue)`     | Two-sided p-value                              |
-| `e(ci_lower)`   | Lower bound of confidence interval             |
-| `e(ci_upper)`   | Upper bound of confidence interval             |
+| `e(pvalue)`     | Two-sided p-value for the primary interval     |
+| `e(ci_lower)`   | Primary CI lower bound (one of the three candidates below, selected by `cimethod()`) |
+| `e(ci_upper)`   | Primary CI upper bound                         |
+| `e(df_r)`       | `max(1, N_1 - 1)` where `N_1 = e(N_treated_units)`; missing when `N_1 < 2` (normal fallback) |
 | `e(mu)`         | Global intercept (joint only; missing for twostep) |
+
+*Confidence interval candidates:*
+
+All three candidate pairs are written to `e()` whenever bootstrap is
+enabled, so downstream code can switch `cimethod()` without re-estimating.
+
+| Scalar                        | Description                                              |
+| ----------------------------- | -------------------------------------------------------- |
+| `e(ci_lower_t)` / `e(ci_upper_t)` | t-wrap CI using `e(se)` and a t(`e(df_r)`) reference |
+| `e(pvalue_t)`                 | Two-sided p-value from the t-wrap                        |
+| `e(ci_lower_normal)` / `e(ci_upper_normal)` | Gaussian-wrap CI using `e(se)` and N(0,1) |
+| `e(pvalue_normal)`            | Two-sided p-value from the normal-wrap                   |
+| `e(ci_lower_percentile)` / `e(ci_upper_percentile)` | Percentile CI from the bootstrap empirical CDF (Algorithm 3 step 6) |
 
 *Tuning parameters:*
 
@@ -482,13 +498,15 @@ Post-estimation (available after `trop`):
 
 | Scalar                | Description                              |
 | --------------------- | ---------------------------------------- |
-| `e(N_units)`          | Number of units                          |
-| `e(N_periods)`        | Number of time periods                   |
+| `e(N_units)`          | Number of panel units (N)                |
+| `e(N_periods)`        | Number of time periods (T)               |
 | `e(N_obs)`            | Total observations                       |
-| `e(N_treat)`          | Number of treated observations           |
+| `e(N_treat)`          | Treated unit-period **cells** (W=1); legacy alias of `e(N_treated_obs)` |
+| `e(N_treated)`        | Length of `e(tau)` = treated-cell count; equals `e(N_treated_obs)` |
+| `e(N_treated_obs)`    | Treated unit-period **cells** (W=1 count, same quantity as `e(N_treat)` and `e(N_treated)`) |
+| `e(N_treated_units)`  | Ever-treated **units** (N_1); cluster count for Algorithm 3 bootstrap |
 | `e(N_control)`        | Number of control observations           |
-| `e(N_treated_units)`  | Number of treated units                  |
-| `e(N_control_units)`  | Number of control units                  |
+| `e(N_control_units)`  | Never-treated units (N_0)                |
 | `e(T_treat_periods)`  | Number of treatment periods              |
 | `e(bootstrap_reps)`   | Number of bootstrap replications         |
 
@@ -545,6 +563,8 @@ Post-estimation (available after `trop`):
 | `e(panelvar)`          | Panel variable name                      |
 | `e(timevar)`           | Time variable name                       |
 | `e(vcetype)`           | `"Bootstrap"` or `""`                    |
+| `e(bsvariance)`        | Bootstrap variance denominator actually used: `sample` or `paper` |
+| `e(cimethod)`          | Primary CI method: `percentile`, `t`, or `normal`; `"percentile->t"` on downgrade |
 | `e(estat_cmd)`         | `"trop_estat"`                           |
 | `e(treatment_pattern)` | Treatment assignment pattern description |
 
@@ -554,8 +574,8 @@ Post-estimation (available after `trop`):
 | ------------------------ | ---------------------------------------------------- |
 | `e(b)`                   | Coefficient vector (1×1, ATT)                        |
 | `e(V)`                   | Variance-covariance matrix (1×1; requires bootstrap) |
-| `e(alpha)`               | Unit fixed effects (N×1)                             |
-| `e(beta)`                | Time fixed effects (T×1)                             |
+| `e(alpha)`               | Unit fixed effects (N×1); row names are the sorted unique values of `e(panelvar)` on the estimation sample (sanitised to valid Stata matrix identifiers) |
+| `e(beta)`                | Time fixed effects (T×1); row names are the sorted unique values of `e(timevar)` on the estimation sample (sanitised to valid Stata matrix identifiers) |
 | `e(factor_matrix)`       | Low-rank factor matrix L (T×N)                       |
 | `e(tau)`                 | Per-cell treatment effects (N_treated×1); populated for both methods. For `joint` the vector carries the scalar `tau` replicated, so `mean(e(tau)) == e(att)` holds to machine precision for either method. |
 | `e(tau_matrix)`          | Treatment effects arranged as a T×N panel-shaped matrix with `.` in untreated cells (when panel metadata is available) |
@@ -583,6 +603,7 @@ Post-estimation (available after `trop`):
 | `estat bootstrap`   | `boot`       | Bootstrap distribution diagnostics         |
 | `estat loocv`       |              | LOOCV hyperparameter selection diagnostics |
 | `estat factors`     |              | Factor matrix (L) SVD analysis             |
+| `estat triplerob`   | `trip`       | Theorem 5.1 triple-robustness bias bound decomposition (`\|Δᵘ\|₂ · \|Δᵗ\|₂ · \|B\|_*`) |
 
 ### predict Types
 
@@ -650,11 +671,42 @@ This is equivalent to choosing the tuning parameters with the smallest out-of-sa
 
 ### Bootstrap Inference
 
-Variance estimation follows Algorithm 3: stratified unit block bootstrap that separately resamples treated and control units with replacement. For each replication $b = 1, \ldots, B$, the full estimation procedure (including LOOCV if applicable) is repeated to obtain $\hat{\tau}^{(b)}$, and the bootstrap variance is:
+Variance estimation follows Algorithm 3: stratified unit block bootstrap
+that separately resamples $N_0$ control units and $N_1$ treated units
+with replacement.  For each replication $b = 1, \ldots, B$, the full
+estimation procedure (including LOOCV if applicable) is repeated to
+obtain $\hat{\tau}^{(b)}$.  The bootstrap variance is
 
-$$\hat{V}_{\tau} = \frac{1}{B} \sum_{b=1}^{B} (\hat{\tau}^{(b)} - \bar{\hat{\tau}})^2$$
+$$\hat{V}_{\tau} = \frac{1}{B - 1} \sum_{b=1}^{B} (\hat{\tau}^{(b)} - \bar{\hat{\tau}})^2$$
 
-where $\bar{\hat{\tau}} = \frac{1}{B}\sum_{b=1}^B \hat{\tau}^{(b)}$ is the mean of bootstrap estimates.
+by default (Bessel-corrected sample variance).  The paper's original
+population-variance denominator $1/B$ is selectable via
+`bsvariance(paper)`; the two choices differ by at most 0.5% at $B = 200$.
+
+**Reference distribution.** Because Algorithm 3 resamples
+*units*, the cluster count that governs the small-sample df is
+$N_1 = $`e(N_treated_units)`.  Stata's `trop` therefore uses
+$t(N_1 - 1)$ whenever $N_1 \geq 2$ and falls back to $\mathcal{N}(0,1)$
+otherwise.  `e(df_r)` is `max(1, N_1 - 1)` or missing (normal
+fallback).  Using a `df` derived from the number of treated *cells*
+would inflate significance as $T_\text{post}$ grows.
+
+**Three confidence intervals, one primary.** Every bootstrap run
+produces three CI candidates:
+
+1. **Percentile CI** — the $\alpha/2$ and $1-\alpha/2$ quantiles of the
+   bootstrap empirical CDF (Algorithm 3 step 6).
+2. **t-wrap CI** — `att ± invttail(df_r, α/2) · se`.
+3. **Normal-wrap CI** — `att ± invnormal(1 − α/2) · se`.
+
+The `cimethod(percentile | t | normal)` option selects which pair is
+promoted to the primary `e(ci_lower)` / `e(ci_upper)`.  The default is
+`percentile` whenever `bootstrap > 0` (the paper's recommended
+distribution-free interval); when `bootstrap(0)` is combined with
+`cimethod(percentile)` the parser downgrades to `t` and records the
+trace in `e(cimethod)` as `"percentile->t"`.  All three candidate pairs
+are always persisted on `e()` so a downstream analyst can switch
+`cimethod()` without re-estimating.
 
 ## Architecture
 
@@ -680,6 +732,124 @@ The package uses a four-layer design for performance and numerical accuracy:
 ```
 
 All numerical computation (LOOCV, SVD, bootstrap) is performed in Rust for speed and precision. The Mata layer handles data validation and result storage. Users do not need the Rust toolchain — the pre-compiled plugin is included.
+
+## Numerical robustness choices
+
+Nine implementation choices in `trop` are documented below.  Each one
+is pinned by a regression test so future refactors cannot silently
+regress, and each is motivated by a first-principles concern rather
+than personal preference:
+
+1. **Adaptive FISTA restart** (`rust/src/estimation.rs`).  The
+   nuclear-norm proximal solver uses the monotone gradient-restart
+   scheme of O'Donoghue & Candès (2015).  Plain FISTA can oscillate
+   when `lambda_nn` sits close to the soft-threshold boundary (for
+   example `lambda_nn ∈ {0.006, 0.011}`); the restart criterion
+   `⟨y_k − x_k, x_k − x_{k−1}⟩ > 0` signals that momentum has
+   overshot the optimum and resets `t_FISTA = 1` without changing the
+   fixed point.  Pinned by `tests/test_fista_restart_stability.do`.
+
+2. **LAPACK `dgelsd` for the weighted least-squares step**
+   (`rust/src/estimation.rs`).  The SVD-based minimum-norm solver
+   returns a Moore–Penrose pseudoinverse solution on rank-deficient
+   designs that arise when the weight vector zeroes out entire
+   rows/columns of the design matrix.  The SVD truncation tolerance
+   `rcond` is `max(ε · max(m, n), 1e-12)` — the floor stabilises
+   $\hat\alpha / \hat\beta$ on the smallest benchmark panels
+   (Basque N = 17, West Germany N = 16) without perturbing $\hat\tau$.
+   Pinned by `tests/test_dgelsd_rank_deficient_wls.do`.
+
+3. **`UnitDistanceCache`** (`rust/src/distance.rs`).  Pairwise
+   $\sum_u (Y_{iu} − Y_{ju})^2$ sums are precomputed once; each
+   leave-$t$-out distance $\text{dist}_{-t}(j, i)$ is then an O(1)
+   subtraction instead of an O(T) rescan.  Cache equivalence is
+   verified to < 10⁻¹⁰ by
+   `tests/test_unit_distance_cache_equivalence.do`.
+
+4. **Deterministic LOOCV tie-breaker** (`rust/src/loocv.rs`,
+   `better_candidate`).  When two `(lambda_time, lambda_unit,
+   lambda_nn)` triples score within `TIE_TOL = 1 × 10⁻¹⁰` of each
+   other, `trop` prefers the larger `lambda_nn`, then the smaller
+   `lambda_time`, then the smaller `lambda_unit`.  ULP-level BLAS
+   differences can otherwise flip `argmin Q(λ)` across platforms.
+   Pinned by `tests/test_loocv_tiebreak_determinism.do`.
+
+5. **Inference reference distribution** (`ado/trop.ado`,
+   `mata/trop_ereturn_store.mata`).  The bootstrap resamples units in
+   stratified fashion (Algorithm 3 step 3), so the cluster count that
+   governs the small-sample reference df is $N_1$, the number of
+   ever-treated units — not the number of treated cells.  `trop`
+   therefore uses $t(N_1 - 1)$ whenever $N_1 \geq 2$ and falls back to
+   the standard normal otherwise.  The primary CI defaults to the
+   paper-specified percentile interval whenever bootstrap is enabled;
+   `cimethod()` re-selects the primary pair from the three candidates
+   (percentile, t, normal).  Pinned by
+   `tests/test_inference_df_is_treated_units.do` and
+   `tests/test_cimethod_option.do`.
+
+6. **Simultaneous-adoption guard for the joint method**
+   (`rust/src/loocv.rs::check_simultaneous_adoption`).  The joint
+   estimator's global weight matrix $\delta$ depends on a shared
+   `treated_periods` count; it is only well-defined when every
+   treated unit enters treatment at the same period $T_1$ and stays
+   treated through the end of the panel (paper Remark 6.1).  The
+   Stata front-end already refuses staggered $D$ for
+   `method(joint)`; as defence-in-depth, every joint C-ABI entry
+   (`stata_estimate_joint`, `stata_bootstrap_trop_variance_joint`,
+   `stata_loocv_grid_search_joint`, `stata_loocv_cycling_search_joint`,
+   and the `_weighted` variants) now short-circuits with
+   `TropError::InvalidDimension` on staggered/non-absorbing $D$ rather
+   than silently mis-computing $T_1$.  Pinned by five unit tests in
+   `rust/src/loocv.rs`.
+
+7. **λ_nn = 0 closed form** (`rust/src/estimation.rs`).  At
+   $\lambda_{nn}=0$, paper Eq. 2 reduces to $\hat{L}_{t,i} =
+   Y_{t,i} - \hat\alpha_i - \hat\beta_t$ on the weighted support
+   ($W>0$) while $\hat{L}$ is unidentified off the support ($W=0$).
+   The implementation therefore sets $\hat{L}$ to the closed-form
+   residual on valid cells and preserves the previous iterate on
+   invalid cells; a debug-build post-condition verifies the latter
+   invariant.  Pinned by
+   `estimation::tests::test_lambda_nn_zero_closed_form_preserves_invalid_cells`.
+
+8. **Unified 5% failure-rate thresholds for LOOCV and bootstrap**
+   (`mata/trop_ereturn_store.mata`, `mata/trop_rust_interface.mata`).
+   Both `_trop_display_bootstrap_warnings` and the Mata-side
+   `check_loocv_fail_rate()` now issue an advisory at **5%** and abort
+   with `rc ∈ {498, 504}` at **50%**.  The 5% threshold is tight
+   enough that, on a panel with ~1,000 `D=0` cells, roughly 50 failed
+   leave-one-out fits surface instead of passing silently — a
+   failure rate of that magnitude can perturb the selected
+   `(lambda_time, lambda_unit, lambda_nn)` off of `Q(λ)`'s true argmin
+   (paper Eq. 5).  The same threshold at the bootstrap stage means
+   11 failures out of 200 replicates are no longer hidden behind the
+   historical 10% gate.  Both failure rates are exposed on
+   `e(loocv_fail_rate)` / `e(bootstrap_fail_rate)` for downstream
+   diagnostics.  Pinned by
+   `tests/test_bootstrap_fail_rate_threshold.do`,
+   `tests/test_ereturn_fail_rate_coverage.do`, and
+   `tests/test_loocv_fail_rate_threshold.do`.
+
+9. **Original-ID row names on `e(alpha)` and `e(beta)`**
+   (`ado/_trop_attach_idnames.ado`).  After estimation completes,
+   `e(alpha)` (`N × 1`) and `e(beta)` (`T × 1`) are rewritten with
+   matrix row names drawn from the sorted unique values of the
+   user-supplied `panelvar` / `timevar` on the estimation sample.
+   Because both `egen ... = group()` and `levelsof` return sorted
+   unique values, row `i` of `e(alpha)` corresponds to the `i`-th
+   unique panel identifier; the plugin indices 1..N remain available
+   through scalar access (`e(alpha)[i, 1]`).  Identifiers are
+   sanitised to valid Stata matrix names (letters / digits /
+   underscore, ≤ 32 chars, non-leading-digit), so numeric IDs like
+   `1989, 1990, ...` render as `_1989, _1990, ...` in
+   `matrix list e(beta)`.  Pinned by
+   `tests/test_alpha_beta_rownames.do`.
+
+**Out of scope (current release).** Survey-weighted bootstrap with
+`pweight`, `strata`, `PSU`, and `FPC`; time-varying covariates
+$X_{it}\beta$ (paper Section 6.2); and switching-treatment patterns
+under `method(joint)`.  These lie outside the current scope and are
+planned for a future release.
 
 ## References
 

@@ -18,10 +18,26 @@
 
       lambda_nn     nuclear-norm penalty on the low-rank component L
 
-    Two preset grid resolutions are available:
+    Three preset grid resolutions are available:
 
-      default    6 x 6 x 5  =   180 combinations
-      extended  14 x 16 x 18 = 4032 combinations
+      default    6 x  6 x  5 =   180 combinations
+      fine       7 x  7 x  7 =   343 combinations
+      extended  14 x 16 x 19 = 4,256 combinations
+
+    The `default` λ_nn grid (0, 0.01, 0.1, 1, 10) is a five-point log-
+    decade ladder covering the empirically relevant range for paper
+    Eq. 2 without evaluating the DID/TWFE corner (λ_nn = +∞), keeping
+    LOOCV cost predictable.
+
+    `fine` adds half-decade λ_nn points (0.0316 and 0.316) in the critical
+    0.01–1 band, filling the single-decade gap in the `default` λ_nn grid.
+    On small panels (e.g. Basque, Germany) this substantially reduces the
+    BLAS-dependent jitter in the selected λ_nn.
+
+    `extended` additionally includes λ_nn = . (= +∞, the DID/TWFE
+    corner per Eq. 2 remark).  Users who want LOOCV to consider the
+    DID/TWFE special case should opt in via `grid_style(extended)` or
+    pass a custom `lambda_nn_grid()`.
 
     User-supplied grids override the corresponding preset dimension.
     When any custom grid is active the style label is set to "custom".
@@ -30,7 +46,7 @@
       _lambda_time_grid   candidate values for lambda_time
       _lambda_unit_grid   candidate values for lambda_unit
       _lambda_nn_grid     candidate values for lambda_nn
-      _grid_style         "default", "extended", or "custom"
+      _grid_style         "default", "fine", "extended", or "custom"
       _n_time             number of lambda_time candidates
       _n_unit             number of lambda_unit candidates
       _n_nn               number of lambda_nn candidates
@@ -54,10 +70,11 @@ program define _trop_set_grid
         local grid_style "default"
     }
     
-    if !inlist("`grid_style'", "default", "extended") {
-        di as error "grid_style() must be 'default' or 'extended'"
+    if !inlist("`grid_style'", "default", "fine", "extended") {
+        di as error "grid_style() must be 'default', 'fine', or 'extended'"
         di as error "  default:    180 combinations (6 x 6 x 5)"
-        di as error "  extended: 4,032 combinations (14 x 16 x 18)"
+        di as error "  fine:       343 combinations (7 x 7 x 7)"
+        di as error "  extended: 4,256 combinations (14 x 16 x 19; includes DID/TWFE corner)"
         exit 198
     }
     
@@ -75,17 +92,29 @@ program define _trop_set_grid
     // every default and custom grid and rejected downstream.
     //
     // λ_nn = ∞ is the paper's DID/TWFE special case (Eq 2 remark: for
-    // λ_nn = ∞, ω = θ = 1, we recover DID/TWFE).  It is included in the
-    // default grid as the Stata missing literal "." so that LOOCV may
-    // select it when the data are well-described by an additive model.
+    // λ_nn = ∞, ω = θ = 1, we recover DID/TWFE).  It is included only in
+    // the `extended` preset (via the Stata missing literal "."), so the
+    // `default` preset keeps a five-point log-decade ladder for λ_nn
+    // without the DID/TWFE corner; users who want LOOCV to evaluate it
+    // should opt in explicitly via `extended` or a custom `lambda_nn_grid()`.
     if "`grid_style'" == "default" {
-        // 6 x 6 x 6 = 216 combinations
+        // 6 x 6 x 5 = 180 combinations
         local default_time_grid "0 0.1 0.5 1 2 5"
         local default_unit_grid "0 0.1 0.5 1 2 5"
-        local default_nn_grid "0 0.01 0.1 1 10 ."
+        local default_nn_grid "0 0.01 0.1 1 10"
+    }
+    else if "`grid_style'" == "fine" {
+        // 7 x 7 x 7 = 343 combinations.  Adds 0.3 to λ_time/λ_unit and
+        // 0.0316 / 0.316 to λ_nn (half-decade steps), filling gaps that
+        // are critical on small panels where the LOOCV objective
+        // Q(λ) surface exhibits non-convex plateaus.  DID/TWFE corner
+        // (λ_nn = ∞) is still reserved for `extended`.
+        local default_time_grid "0 0.1 0.3 0.5 1 2 5"
+        local default_unit_grid "0 0.1 0.3 0.5 1 2 5"
+        local default_nn_grid "0 0.01 0.0316 0.1 0.316 1 10"
     }
     else {
-        // 14 x 16 x 19 = 4256 combinations
+        // 14 x 16 x 19 = 4256 combinations; includes λ_nn = 10 and ∞.
         local default_time_grid "0 0.1 0.2 0.25 0.3 0.35 0.4 0.5 0.75 1 1.5 2 3 5"
         local default_unit_grid "0 0.1 0.2 0.25 0.3 0.35 0.4 0.5 0.75 1 1.2 1.5 1.6 2 3 5"
         local default_nn_grid "0 0.005 0.006 0.01 0.011 0.02 0.05 0.1 0.15 0.151 0.2 0.3 0.5 0.7 0.9 1 5 10 ."

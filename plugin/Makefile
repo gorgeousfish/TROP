@@ -51,7 +51,13 @@ ifeq ($(UNAME_S),Darwin)
     LDFLAGS := -bundle -undefined dynamic_lookup $(ARCH_FLAGS)
     
     # macOS needs to link against system frameworks for Rust
-    LIBS := -lSystem -lc -lm
+    # Accelerate.framework supplies the LAPACK (dgelsd$NEWLAPACK) and
+    # BLAS symbols referenced by lapack-src=features=["accelerate"];
+    # without an explicit link the symbols resolve lazily via the host
+    # process at runtime, which on some Stata builds lands in a slow
+    # compatibility path.  Linking the framework directly removes that
+    # round-trip.
+    LIBS := -lSystem -lc -lm -framework Accelerate
     
 else ifeq ($(UNAME_S),Linux)
     # Linux

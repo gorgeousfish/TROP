@@ -47,10 +47,11 @@ program define _trop_validate_params
 
     // --- grid_style(): regularization grid layout ---
 
-    if !inlist("`grid_style'", "extended", "default", "custom") {
-        di as error "grid_style() must be 'default' or 'extended'"
-        di as error "  default:  180 combinations (recommended)"
-        di as error "  extended: 4,032 combinations"
+    if !inlist("`grid_style'", "extended", "fine", "default", "custom") {
+        di as error "grid_style() must be 'default', 'fine', or 'extended'"
+        di as error "  default:    180 combinations (recommended)"
+        di as error "  fine:       343 combinations (half-decade λ_nn, recommended for small panels)"
+        di as error "  extended: 4,256 combinations (includes DID/TWFE corner λ_nn=∞)"
         di as error "  (custom grids via lambda_*_grid() options set this automatically)"
         exit 198
     }

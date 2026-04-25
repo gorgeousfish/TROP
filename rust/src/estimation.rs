@@ -18,9 +18,20 @@ use faer::Mat;
 use lapack::dgelsd;
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 
-/// Maximum inner iterations for the proximal gradient solver on the nuclear norm subproblem.
-/// The proximal operator converges quickly; 10 iterations suffice for typical panel dimensions.
+/// Maximum inner iterations for the proximal gradient solver on the
+/// nuclear norm subproblem.  The proximal operator converges quickly; 10
+/// iterations suffice for typical panel dimensions.
 const MAX_INNER_ITER: usize = 10;
+
+/// Inner-iteration ceiling applied when `λ_nn` sits in the "small but
+/// positive" regime where proximal-gradient convergence slows from
+/// O((1−√(μ/L))^k) (strongly convex) toward O(1/k²) (vanilla FISTA on a
+/// non-strongly-convex quadratic).  Paper Eq. 2 only requires `argmin`
+/// without an iteration bound, so the relaxed cap is paper-compatible;
+/// early-break on `tol` keeps the cost identical to `MAX_INNER_ITER` when
+/// the iterate has already converged.  Audit note 2026-04 first-principles
+/// review (T5).
+const MAX_INNER_ITER_HIGH: usize = 50;
 
 /// SVD singular value truncation tolerance.
 ///
@@ -37,6 +48,59 @@ pub const SVD_TRUNCATION_TOL: f64 = 1e-10;
 /// If the sum of all weights falls below this threshold, the estimation
 /// is considered degenerate and returns `None`.
 pub const WEIGHT_SUM_TOL: f64 = 1e-10;
+
+/// Debug-only check that `delta` is already (1 − D)-masked.
+///
+/// Several joint-method helpers, in particular [`solve_joint_no_lowrank`]
+/// and [`solve_joint_with_lowrank`], rely on the caller having
+/// pre-multiplied `delta` by `(1 − D)` so that treated cells contribute
+/// zero to the weighted quadratic loss.  The post-hoc `τ` formula derives
+/// from this invariant: if a caller ever forwards an unmasked `delta`,
+/// treated rows leak into the control regression and `τ = mean_{D=1}
+/// (Y − μ − α − β − L)` silently shifts.
+///
+/// This function verifies the invariant in `debug_assertions` builds
+/// (debug + test profiles) and is a complete no-op in release (so the
+/// FFI hot path pays zero runtime cost).  Call it at every entry point
+/// where both `d` and `delta` are in scope — the Stata plugin build uses
+/// `--release`, so the check disappears there but fires during
+/// `cargo test` if an internal refactor forgets the mask.
+///
+/// See Section B.2 of the 2026-04 first-principles review.
+#[inline]
+pub(crate) fn debug_assert_delta_is_1minus_d_masked(
+    d: &ArrayView2<f64>,
+    delta: &ArrayView2<f64>,
+    site: &'static str,
+) {
+    if cfg!(debug_assertions) {
+        debug_assert_eq!(
+            delta.nrows(), d.nrows(),
+            "{}: delta rows ({}) != d rows ({})",
+            site, delta.nrows(), d.nrows()
+        );
+        debug_assert_eq!(
+            delta.ncols(), d.ncols(),
+            "{}: delta cols ({}) != d cols ({})",
+            site, delta.ncols(), d.ncols()
+        );
+        let t_dim = d.nrows();
+        let n_dim = d.ncols();
+        for t in 0..t_dim {
+            for i in 0..n_dim {
+                if d[[t, i]] == 1.0 {
+                    let w = delta[[t, i]];
+                    debug_assert!(
+                        !w.is_finite() || w == 0.0,
+                        "{}: delta not (1-D)-masked at ({}, {}): D=1 but \
+                         delta = {} (must be 0 or non-finite)",
+                        site, t, i, w
+                    );
+                }
+            }
+        }
+    }
+}
 
 /// Result type for twostep per-observation estimation.
 ///
@@ -205,6 +269,7 @@ pub fn estimate_model(
     max_iter: usize,
     tol: f64,
     exclude_obs: Option<(usize, usize)>,
+    warm_start: Option<(&Array1<f64>, &Array1<f64>, &Array2<f64>)>,
 ) -> TwostepModelResult {
     // Create estimation mask
     let mut est_mask =
@@ -267,10 +332,16 @@ pub fn estimate_model(
         }
     });
 
-    // Initialize
-    let mut alpha = Array1::<f64>::zeros(n_units);
-    let mut beta = Array1::<f64>::zeros(n_periods);
-    let mut l = Array2::<f64>::zeros((n_periods, n_units));
+    // Initialize (warm start reuses previous solution when available)
+    let (mut alpha, mut beta, mut l) = if let Some((a0, b0, l0)) = warm_start {
+        (a0.clone(), b0.clone(), l0.clone())
+    } else {
+        (
+            Array1::<f64>::zeros(n_units),
+            Array1::<f64>::zeros(n_periods),
+            Array2::<f64>::zeros((n_periods, n_units)),
+        )
+    };
 
     // Track actual iteration count and convergence status
     let mut actual_iters: usize = 0;
@@ -333,14 +404,44 @@ pub fn estimate_model(
             }
         }
 
-        // When λ = 0, set L = R directly for valid observations (no nuclear norm penalty).
+        // λ_nn = 0 closed form of paper Eq. (2):
+        //
+        //   argmin_{L}  Σ_{t,i} W_{t,i} (Y_{t,i} − α_i − β_t − L_{t,i})^2
+        //
+        // at a valid cell (W > 0) the gradient is zero iff
+        // L_{t,i} = Y_{t,i} − α_i − β_t = R_target_{t,i}.
+        // At an invalid cell (W = 0) the loss is independent of L, so the
+        // argmin is the whole real line; we preserve the previous iterate to
+        // avoid fabricating signal at zero-weight positions (consistent with
+        // the Eq. (2) interpretation that L is identified only on the
+        // weighted support).
         if lambda_nn <= 0.0 {
+            // Snapshot invalid-cell values for the debug-only post-condition.
+            #[cfg(debug_assertions)]
+            let l_snapshot = l.clone();
+
             for t in 0..n_periods {
                 for i in 0..n_units {
                     if valid_mask[[t, i]] {
                         l[[t, i]] = r_target[[t, i]];
                     }
                     // Invalid observations (w = 0): keep L unchanged.
+                }
+            }
+
+            // Post-condition: invalid cells untouched (see comment above).
+            #[cfg(debug_assertions)]
+            {
+                for t in 0..n_periods {
+                    for i in 0..n_units {
+                        if !valid_mask[[t, i]] {
+                            debug_assert_eq!(
+                                l[[t, i]],
+                                l_snapshot[[t, i]],
+                                "λ_nn = 0 closed form must not alter L at invalid (w=0) cell ({t},{i})",
+                            );
+                        }
+                    }
                 }
             }
         } else {
@@ -368,7 +469,17 @@ pub fn estimate_model(
             let mut l_prev = l.clone();
             let mut t_fista = 1.0_f64;
 
-            for _ in 0..MAX_INNER_ITER {
+            // Adaptive inner-iteration cap: small positive λ_nn slows FISTA
+            // by an order of magnitude, so we allow 5× more iterations in
+            // the (0, 0.1) band.  Early-break on `tol` keeps the cost
+            // unchanged whenever the iterate converges before the cap.
+            let inner_cap = if lambda_nn > 0.0 && lambda_nn < 0.1 {
+                MAX_INNER_ITER_HIGH
+            } else {
+                MAX_INNER_ITER
+            };
+
+            for _ in 0..inner_cap {
                 let l_inner_old = l.clone();
 
                 // Nesterov momentum extrapolation.
@@ -421,7 +532,11 @@ pub fn estimate_model(
             }
         }
 
-        // Check convergence
+        // Outer convergence: simultaneous stability of all three blocks.
+        // Eq. 2 is `argmin` over (α, β, L); monitoring only ‖ΔL‖ can declare
+        // convergence while (α, β) are still drifting inside the null space
+        // of the row/column centering identification.  See the matching note
+        // in `solve_joint_with_lowrank`.
         let alpha_diff = max_abs_diff(&alpha, &alpha_old);
         let beta_diff = max_abs_diff(&beta, &beta_old);
         let l_diff = max_abs_diff_2d(&l, &l_old);
@@ -541,9 +656,27 @@ pub fn solve_joint_no_lowrank(
     // Singular values output
     let mut s = vec![0.0_f64; min_mn];
 
-    // rcond for rank determination: ε · max(m, n)
+    // rcond for rank determination.
+    //
+    // Baseline `ε · max(m, n)` is the LAPACK-recommended default and
+    // suffices for typical panel dimensions where max(m, n) ≫ 10.  On the
+    // paper's smallest benchmarks (Basque N = 17, West Germany N = 16,
+    // T × N < 400) the product sits at ~1e-14, which is *below* the
+    // residual noise level of a double-precision SVD on rank-deficient
+    // designs.  In that regime spurious "nonzero" singular values leak
+    // into the minimum-norm solution and perturb α̂ / β̂ away from the
+    // well-conditioned Moore–Penrose pseudoinverse.
+    //
+    // Floor at 1e-12 — a safe margin above f64 SVD noise on weighted
+    // design matrices (~1e-14) and well below the singular values of any
+    // non-trivially identified TWFE design (≥ 1 by construction since α_0
+    // and β_0 are dropped).  This preserves τ̂ exactly (the ATT residual
+    // does not depend on the specific element of the α + β + const
+    // null-space picked by `dgelsd`) while stabilising the reported
+    // `e(alpha)` / `e(beta)` on tiny panels.  Audit note 2026-04
+    // first-principles review (T6).
     let eps = f64::EPSILON;
-    let rcond = eps * (m.max(n) as f64);
+    let rcond = (eps * (m.max(n) as f64)).max(1e-12);
 
     // Output rank
     let mut rank: i32 = 0;
@@ -675,12 +808,12 @@ pub fn solve_joint_no_lowrank(
 }
 
 /// Solve the joint TWFE + low-rank model via alternating minimization, with
-/// post-hoc τ extraction.
+/// post-hoc τ extraction (paper Remark 6.1 aggregation applied to Eq. 2).
 ///
 /// The weight matrix `delta` must already carry the paper's (1 − D) mask so
-/// treated cells contribute zero to the weighted quadratic loss. The objective
-/// solved is therefore the paper's Equation 2 without τ as an explicit
-/// variable:
+/// treated cells contribute zero to the weighted quadratic loss.  The
+/// objective solved is Eq. 2 with τ factored out of the explicit variable
+/// list (recovered post-hoc on the treated cells):
 ///
 /// ```text
 /// min_{μ, α, β, L}   Σ_{t, i} δ_{t, i} (Y_{t, i} − μ − α_i − β_t − L_{t, i})²
@@ -691,8 +824,35 @@ pub fn solve_joint_no_lowrank(
 ///   1. Fix L, solve (μ, α, β) via WLS (control-only thanks to δ masking).
 ///   2. Fix (μ, α, β), update L via a few FISTA/Nesterov proximal iterations.
 /// After outer convergence we do a final re-solve of (μ, α, β) using the
-/// converged L, then compute τ post-hoc as the mean residual over treated
-/// observations:  τ̂ = mean_{D=1} (Y − μ − α − β − L).
+/// converged L (otherwise the returned triple would not be mutually
+/// consistent with the reported L), then compute τ post-hoc as the mean
+/// residual over treated observations:  τ̂ = mean_{D=1} (Y − μ − α − β − L).
+///
+/// # Convergence criterion (paper Eq. 2, first-principles)
+///
+/// Paper Eq. 2 requires `argmin_{μ, α, β, L}` of the weighted penalized
+/// loss.  Because the block-coordinate iteration is only *monotone* on the
+/// objective (each block is a convex sub-minimization), convergence of the
+/// outer loop is judged by *simultaneous* stability of all three blocks:
+///
+/// ```text
+/// max(‖L − L_old‖∞, ‖α − α_old‖∞, ‖β − β_old‖∞) < tol.
+/// ```
+///
+/// Monitoring only ‖L − L_old‖∞ is insufficient near the fixed point: L
+/// can stabilise while (α, β) are still drifting inside the null space
+/// introduced by the α_0 = β_0 = 0 identification, yielding a point that
+/// satisfies the L-only criterion but sits away from the Eq. 2 stationary
+/// point.  Requiring all three blocks simultaneously costs a few outer
+/// iterations but cannot cause divergence, and is necessary for the Stata
+/// contract `e(converged) == 1 ⇒ block-coordinate residual < tol` (pinned
+/// by `tests/test_joint_outer_convergence_parity.do`).
+///
+/// The inner FISTA iteration monitors `‖L_new − L_inner_old‖∞` where
+/// `L_inner_old` is the iterate *before* the current FISTA step.  An
+/// alternative measure based on the pre-SVD iterate would count the
+/// magnitude of the soft-thresholding jump, which can be large even when
+/// the fixed-point-progress indicator is small.
 ///
 /// # Arguments
 /// * `y` - Outcome matrix Y (T × N).
@@ -716,6 +876,14 @@ pub fn solve_joint_with_lowrank(
 ) -> JointLowRankResult {
     let n_periods = y.nrows();
     let n_units = y.ncols();
+
+    // B.2 defensive check: the caller must already have (1 − D)-masked the
+    // `delta` matrix before forwarding it here.  Violating this invariant
+    // contaminates the post-hoc τ = mean_{D=1} (Y − μ − α − β − L) formula.
+    // The check is a no-op in release (--release sets debug_assertions=false).
+    debug_assert_delta_is_1minus_d_masked(
+        d, delta, "solve_joint_with_lowrank input",
+    );
 
     // Sanitize Y: replace non-finite values with 0 for the inner arithmetic.
     // Zero the corresponding δ so these positions contribute nothing.
@@ -793,12 +961,21 @@ pub fn solve_joint_with_lowrank(
             }
         });
 
-        // FISTA inner loop: max 20 steps, early exit on tol.
+        // FISTA inner loop: max 20 steps by default (100 in the small
+        // positive λ_nn band where convergence slows); early exit on tol.
+        // See `MAX_INNER_ITER_HIGH` and the matching twostep branch for
+        // the paper Eq. 2 justification.
         const MAX_JOINT_INNER_ITER: usize = 20;
+        const MAX_JOINT_INNER_ITER_HIGH: usize = 100;
+        let joint_inner_cap = if lambda_nn > 0.0 && lambda_nn < 0.1 {
+            MAX_JOINT_INNER_ITER_HIGH
+        } else {
+            MAX_JOINT_INNER_ITER
+        };
         let mut l_prev = l.clone();
         let mut t_fista = 1.0_f64;
 
-        for _ in 0..MAX_JOINT_INNER_ITER {
+        for _ in 0..joint_inner_cap {
             // Snapshot at the start of this inner step.  Needed both for the
             // gradient-restart criterion below and (incidentally) for an
             // unambiguous "progress between two consecutive iterates"
@@ -850,7 +1027,9 @@ pub fn solve_joint_with_lowrank(
             }
         }
 
-        // Outer convergence check on L, α, and β.
+        // Outer convergence check on L, α, and β.  See the function-level
+        // "Convergence criterion (paper Eq. 2, first-principles)" docstring
+        // section for why all three blocks are monitored rather than just L.
         let l_diff = max_abs_diff_2d(&l, &l_old);
         let alpha_diff = max_abs_diff(&alpha, &alpha_old);
         let beta_diff = max_abs_diff(&beta, &beta_old);
@@ -861,7 +1040,10 @@ pub fn solve_joint_with_lowrank(
     }
 
     // Final re-solve of (μ, α, β) using the converged L so the returned
-    // parameters are mutually consistent (cf. diff-diff 3.1.1 behaviour).
+    // parameters are mutually consistent: the penultimate WLS step fitted
+    // (μ, α, β) against a stale L, so without this re-solve the returned
+    // triple would correspond to a (L_old, μ, α, β) pair rather than the
+    // reported (L, μ, α, β).
     let y_adj_final = Array2::from_shape_fn((n_periods, n_units), |(t, i)| {
         y_safe[[t, i]] - l[[t, i]]
     });
@@ -935,6 +1117,110 @@ mod tests {
 
         let diff = max_abs_diff(&a, &b);
         assert!((diff - 0.5).abs() < 1e-10);
+    }
+
+    /// λ_nn = 0 closed-form invariant (paper Eq. 2):
+    ///
+    ///   L̂_{t,i} = Y_{t,i} − α̂_i − β̂_t  on weighted support (W > 0)
+    ///   L̂_{t,i} is carried over unchanged on W = 0 cells
+    ///
+    /// This test constructs a tiny panel with a known zero-weight cell and
+    /// verifies that the fitted L matches the closed form on the support and
+    /// that the zero-weight cell is left at its initial value (0.0 here).
+    #[test]
+    fn test_lambda_nn_zero_closed_form_preserves_invalid_cells() {
+        let n_periods = 3_usize;
+        let n_units = 2_usize;
+
+        // Y is arbitrary; a single treated cell at (t=2, i=1) is dropped
+        // from the control mask so it cannot pin the low-rank fit.
+        let y = array![[1.0, 2.0], [2.0, 3.0], [3.0, 4.0]];
+        // control_mask = (1 − D) — mandatory for the in-sample cells.
+        let control_mask = array![[1u8, 1], [1, 1], [1, 0]];
+
+        // Weight matrix: uniform on controls, zero on the treated cell so
+        // the fitted L at (2, 1) cannot be pinned by the data.
+        let w = array![[1.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
+
+        // λ_nn = 0 triggers the closed-form branch.
+        let result = estimate_model(
+            &y.view(),
+            &control_mask.view(),
+            &w.view(),
+            0.0,       // λ_nn
+            n_periods,
+            n_units,
+            100,
+            1e-10,
+            None,
+            None,
+        );
+
+        let (alpha, beta, l, _n_iters, converged) = result.expect("λ_nn=0 fit should succeed");
+        assert!(converged, "λ_nn=0 closed form should converge in few iterations");
+
+        // On the weighted support: L ≈ Y − α − β.
+        for t in 0..n_periods {
+            for i in 0..n_units {
+                if w[[t, i]] > 0.0 {
+                    let expected = y[[t, i]] - alpha[i] - beta[t];
+                    assert!(
+                        (l[[t, i]] - expected).abs() < 1e-8,
+                        "λ_nn=0 closed form: L[{t},{i}] = {}, expected {}",
+                        l[[t, i]],
+                        expected,
+                    );
+                }
+            }
+        }
+
+        // Off the support (w=0): L must be exactly the initial value (0.0)
+        // because no iterate ever touches those cells.
+        assert_eq!(
+            l[[2, 1]],
+            0.0,
+            "Invalid cell (w=0) must retain the initial L value"
+        );
+    }
+
+    /// B.2 audit: delta that is already (1 − D)-masked must pass the
+    /// debug assertion without panicking.
+    #[test]
+    fn test_debug_assert_delta_mask_passes_for_masked_delta() {
+        let d = array![[0.0, 0.0], [0.0, 1.0]];
+        // Treated cell (t=1, i=1): δ must be 0 or non-finite.
+        let delta_ok = array![[1.0, 1.0], [1.0, 0.0]];
+        debug_assert_delta_is_1minus_d_masked(
+            &d.view(),
+            &delta_ok.view(),
+            "test_mask_pass",
+        );
+        // Also accept NaN/Inf at the masked cell (compute_joint_weights can
+        // emit those when pre-period data is missing for that unit).
+        let delta_nan = array![[1.0, 1.0], [1.0, f64::NAN]];
+        debug_assert_delta_is_1minus_d_masked(
+            &d.view(),
+            &delta_nan.view(),
+            "test_mask_pass_nan",
+        );
+    }
+
+    /// B.2 audit: in a debug build, forwarding an unmasked δ to the check
+    /// panics — so a downstream caller that forgets `δ *= (1 − D)` does not
+    /// silently corrupt post-hoc τ.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "delta not (1-D)-masked")]
+    fn test_debug_assert_delta_mask_panics_for_unmasked_delta() {
+        let d = array![[0.0, 0.0], [0.0, 1.0]];
+        // Treated cell (t=1, i=1) has a finite, non-zero δ — contract
+        // violation.
+        let delta_bad = array![[1.0, 1.0], [1.0, 1.0]];
+        debug_assert_delta_is_1minus_d_masked(
+            &d.view(),
+            &delta_bad.view(),
+            "test_mask_fail",
+        );
     }
 
     #[test]
@@ -1124,6 +1410,7 @@ mod tests {
             100,  // max_iter
             1e-6, // tol
             None,
+            None,
         );
 
         assert!(result.is_some(), "Model estimation should converge");
@@ -1167,6 +1454,7 @@ mod tests {
             100,
             1e-6,
             Some((1, 0)), // Exclude observation at (1, 0)
+            None,
         );
 
         assert!(
@@ -1282,6 +1570,72 @@ mod tests {
 
         // tau should be positive (treatment effect is positive)
         assert!(tau > 0.0, "tau should be positive, got {}", tau);
+    }
+
+    /// T5 regression: verify that small positive `λ_nn` values (< 0.1) still
+    /// converge to a sensible solution under the expanded inner-iteration
+    /// cap.  Before T5, `MAX_INNER_ITER = 10` could leave the FISTA subproblem
+    /// short of the `tol = 1e-8` threshold; with the expanded cap of 50
+    /// (twostep) / 100 (joint) the iterate settles well within the relaxed
+    /// bound.  The test does not require strict numerical parity with a
+    /// larger `λ_nn` run (different λ_nn changes the optimum); it only
+    /// requires convergence and a finite τ.
+    #[test]
+    fn test_fista_inner_cap_small_lambda_nn() {
+        // Small panel, single treated cell at (3, 2).  True τ = 3 (8 - 5).
+        let y = array![
+            [1.0, 2.0, 3.0],
+            [2.0, 3.0, 4.0],
+            [3.0, 4.0, 5.0],
+            [4.0, 5.0, 8.0]
+        ];
+        let d = array![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ];
+        let delta = array![
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0]  // (1 − D) mask: treated cell zeroed
+        ];
+
+        // λ_nn = 0.01 lands in the expanded-cap band (0, 0.1).
+        let result_small = solve_joint_with_lowrank(
+            &y.view(),
+            &d.view(),
+            &delta.view(),
+            0.01,
+            200,   // outer max_iter
+            1e-8,  // tight tol
+        );
+        assert!(result_small.is_some(), "λ_nn = 0.01 must converge under expanded cap");
+        let (_mu_s, _alpha_s, _beta_s, _l_s, tau_s, _n_iters_s, converged_s) =
+            result_small.unwrap();
+        assert!(converged_s, "λ_nn = 0.01 must report converged = true");
+        assert!(tau_s.is_finite(), "τ(λ_nn = 0.01) must be finite, got {}", tau_s);
+
+        // Baseline at λ_nn = 0.5 (outside the expanded band; uses default cap).
+        let result_big = solve_joint_with_lowrank(
+            &y.view(),
+            &d.view(),
+            &delta.view(),
+            0.5,
+            200,
+            1e-8,
+        );
+        assert!(result_big.is_some(), "λ_nn = 0.5 baseline must converge");
+        let (_mu_b, _alpha_b, _beta_b, _l_b, tau_b, _n_iters_b, _conv_b) =
+            result_big.unwrap();
+        assert!(tau_b.is_finite(), "τ(λ_nn = 0.5) baseline must be finite");
+
+        // Both runs should capture the treatment effect (τ > 0) — sanity
+        // check that the expanded cap has not flipped the sign or inflated
+        // τ beyond a reasonable range around the true effect of 3.
+        assert!(tau_s > 0.0 && tau_s < 10.0, "τ(λ_nn = 0.01) out of range: {}", tau_s);
+        assert!(tau_b > 0.0 && tau_b < 10.0, "τ(λ_nn = 0.5) out of range: {}", tau_b);
     }
 
     #[test]
@@ -1542,6 +1896,7 @@ mod tests {
             100,
             1e-6,
             None,
+            None,
         );
 
         let (alpha, beta, l, _n_iters, _converged) = result.unwrap();
@@ -1610,7 +1965,7 @@ mod proptests {
 
             let result = estimate_model(
                 &y.view(), &mask.view(), &w.view(),
-                lambda_nn, 5, 4, 100, 1e-6, None,
+                lambda_nn, 5, 4, 100, 1e-6, None, None,
             );
 
             prop_assert!(result.is_some(),
@@ -1632,7 +1987,7 @@ mod proptests {
 
             let result = estimate_model(
                 &y.view(), &mask.view(), &w.view(),
-                lambda_nn, 6, 5, 100, 1e-6, None,
+                lambda_nn, 6, 5, 100, 1e-6, None, None,
             );
 
             let (alpha, beta, l, _n_iters, _converged) = result.unwrap();
@@ -1652,7 +2007,7 @@ mod proptests {
 
             let result = estimate_model(
                 &y.view(), &mask.view(), &w.view(),
-                lambda_nn, 5, 4, 100, 1e-6, None,
+                lambda_nn, 5, 4, 100, 1e-6, None, None,
             );
 
             let (alpha, beta, l, _n_iters, _converged) = result.unwrap();
@@ -1680,11 +2035,11 @@ mod proptests {
 
             let result_1 = estimate_model(
                 &y.view(), &mask.view(), &w.view(),
-                lambda_nn, 5, 4, 1, 1e-6, None,
+                lambda_nn, 5, 4, 1, 1e-6, None, None,
             );
             let result_100 = estimate_model(
                 &y.view(), &mask.view(), &w.view(),
-                lambda_nn, 5, 4, 100, 1e-6, None,
+                lambda_nn, 5, 4, 100, 1e-6, None, None,
             );
 
             let (a1, b1, l1, n_iters_1, _conv1) = result_1.unwrap();
@@ -1727,11 +2082,11 @@ mod proptests {
 
             let result_low = estimate_model(
                 &y.view(), &mask.view(), &w.view(),
-                0.01, 5, 4, 100, 1e-6, None,
+                0.01, 5, 4, 100, 1e-6, None, None,
             );
             let result_high = estimate_model(
                 &y.view(), &mask.view(), &w.view(),
-                10.0, 5, 4, 100, 1e-6, None,
+                10.0, 5, 4, 100, 1e-6, None, None,
             );
 
             let (_, _, l_low, _, _) = result_low.unwrap();

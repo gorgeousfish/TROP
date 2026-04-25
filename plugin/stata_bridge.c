@@ -59,6 +59,7 @@ TropCommand parse_command(const char *cmd) {
     if (cmd == NULL) return CMD_UNKNOWN;
     
     if (strcmp(cmd, "loocv_twostep") == 0) return CMD_LOOCV_TWOSTEP;
+    if (strcmp(cmd, "loocv_twostep_exhaustive") == 0) return CMD_LOOCV_TWOSTEP_EXHAUSTIVE;
     if (strcmp(cmd, "loocv_joint") == 0) return CMD_LOOCV_JOINT;
     if (strcmp(cmd, "loocv_joint_exhaustive") == 0) return CMD_LOOCV_JOINT_EXHAUSTIVE;
     if (strcmp(cmd, "estimate_twostep") == 0) return CMD_ESTIMATE_TWOSTEP;
@@ -559,11 +560,15 @@ static ST_retcode handle_loocv_twostep(void) {
     double best_time, best_unit, best_nn, best_score;
     int n_valid, n_attempted;
     int first_failed_t, first_failed_i;  /* first failed LOOCV observation indices */
+    double stage1_time, stage1_unit, stage1_nn;  /* Stage-1 univariate init (Footnote 2) */
     ST_retcode rc;
     int rust_rc;
     
     first_failed_t = -1;
     first_failed_i = -1;
+    stage1_time = 0.0;
+    stage1_unit = 0.0;
+    stage1_nn = 0.0;
     
     TROP_LOG_INFO("starting LOOCV grid search (twostep)");
     
@@ -632,7 +637,8 @@ static ST_retcode handle_loocv_twostep(void) {
         max_iter, tol,
         &best_time, &best_unit, &best_nn, &best_score,
         &n_valid, &n_attempted,
-        &first_failed_t, &first_failed_i
+        &first_failed_t, &first_failed_i,
+        &stage1_time, &stage1_unit, &stage1_nn
     );
     
     if (rust_rc != TROP_SUCCESS) {
@@ -651,9 +657,14 @@ static ST_retcode handle_loocv_twostep(void) {
     /* First failed observation indices (for diagnostics) */
     SF_scal_save("__trop_loocv_first_failed_t", (double)first_failed_t);
     SF_scal_save("__trop_loocv_first_failed_i", (double)first_failed_i);
+    /* Stage-1 univariate init (paper Footnote 2); cycling path only. */
+    SF_scal_save("__trop_stage1_lambda_time", stage1_time);
+    SF_scal_save("__trop_stage1_lambda_unit", stage1_unit);
+    SF_scal_save("__trop_stage1_lambda_nn", stage1_nn);
     
-    TROP_LOG_INFO("LOOCV complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, first_failed=(%d,%d)",
-                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, first_failed_t, first_failed_i);
+    TROP_LOG_INFO("LOOCV complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, first_failed=(%d,%d), stage1=(%g,%g,%g)",
+                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, first_failed_t, first_failed_i,
+                  stage1_time, stage1_unit, stage1_nn);
     
     rc = TROP_SUCCESS;
     
@@ -666,6 +677,143 @@ cleanup:
     free(lambda_unit_grid);
     free(lambda_nn_grid);
     
+    return rc;
+}
+
+/* ============================================================================
+ * Command Handler: LOOCV Twostep Exhaustive
+ * ============================================================================ */
+
+/**
+ * Exhaustive (Cartesian) grid search variant of handle_loocv_twostep.
+ *
+ * Reads the same Stata scalars/matrices as handle_loocv_twostep, then calls
+ * stata_loocv_grid_search_exhaustive which enumerates all |grid|^3 triples in
+ * parallel.  Writes identical output scalars so the downstream Mata/ADO layers
+ * are agnostic to which strategy was used.
+ */
+static ST_retcode handle_loocv_twostep_exhaustive(void) {
+    ST_int n_units, n_periods;
+    double *y_matrix = NULL;
+    double *d_matrix = NULL;
+    unsigned char *control_mask = NULL;
+    int64_t *time_dist = NULL;
+    double *lambda_time_grid = NULL;
+    double *lambda_unit_grid = NULL;
+    double *lambda_nn_grid = NULL;
+    int lambda_time_len, lambda_unit_len, lambda_nn_len;
+    double max_iter_d, tol;
+    int max_iter;
+    double best_time, best_unit, best_nn, best_score;
+    int n_valid, n_attempted;
+    int first_failed_t, first_failed_i;
+    ST_retcode rc;
+    int rust_rc;
+
+    first_failed_t = -1;
+    first_failed_i = -1;
+
+    TROP_LOG_INFO("starting LOOCV exhaustive grid search (twostep)");
+
+    /* Read dimensions */
+    rc = read_dimensions(&n_units, &n_periods);
+    if (rc != TROP_SUCCESS) goto cleanup;
+
+    /* Allocate memory */
+    y_matrix = (double *)malloc(n_units * n_periods * sizeof(double));
+    d_matrix = (double *)malloc(n_units * n_periods * sizeof(double));
+    control_mask = (unsigned char *)malloc(n_units * n_periods);
+    time_dist = (int64_t *)malloc(n_periods * n_periods * sizeof(int64_t));
+
+    if (!y_matrix || !d_matrix || !control_mask || !time_dist) {
+        TROP_LOG_ERROR("memory allocation failed");
+        rc = TROP_ERR_MEMORY;
+        goto cleanup;
+    }
+
+    /* Read data from Stata variables (indices from scalars) */
+    double y_idx_d, d_idx_d, ctrl_idx_d;
+    SF_scal_use("__trop_y_varindex", &y_idx_d);
+    SF_scal_use("__trop_d_varindex", &d_idx_d);
+    SF_scal_use("__trop_ctrl_varindex", &ctrl_idx_d);
+
+    rc = read_panel_to_matrix((ST_int)y_idx_d, n_periods, n_units, y_matrix);
+    if (rc != TROP_SUCCESS) goto cleanup;
+
+    rc = read_panel_to_matrix((ST_int)d_idx_d, n_periods, n_units, d_matrix);
+    if (rc != TROP_SUCCESS) goto cleanup;
+
+    rc = read_control_mask((ST_int)ctrl_idx_d, n_periods, n_units, control_mask);
+    if (rc != TROP_SUCCESS) goto cleanup;
+
+    /* Read time distance matrix */
+    rc = read_time_dist_matrix("__trop_time_dist", n_periods, time_dist);
+    if (rc != TROP_SUCCESS) goto cleanup;
+
+    /* Read lambda grids */
+    rc = read_lambda_grid("__trop_lambda_time_grid", &lambda_time_grid, &lambda_time_len);
+    if (rc != TROP_SUCCESS) goto cleanup;
+
+    rc = read_lambda_grid("__trop_lambda_unit_grid", &lambda_unit_grid, &lambda_unit_len);
+    if (rc != TROP_SUCCESS) goto cleanup;
+
+    rc = read_lambda_grid("__trop_lambda_nn_grid", &lambda_nn_grid, &lambda_nn_len);
+    if (rc != TROP_SUCCESS) goto cleanup;
+
+    /* Convert infinity sentinel values in grids */
+    convert_lambda_infinity(lambda_time_grid, lambda_time_len, "time");
+    convert_lambda_infinity(lambda_unit_grid, lambda_unit_len, "unit");
+    convert_lambda_infinity(lambda_nn_grid, lambda_nn_len, "nn");
+
+    /* Read algorithm parameters */
+    SF_scal_use("__trop_max_iter", &max_iter_d);
+    SF_scal_use("__trop_tol", &tol);
+
+    max_iter = (int)max_iter_d;
+
+    /* Call Rust: exhaustive Cartesian search over the full grid. */
+    rust_rc = stata_loocv_grid_search_exhaustive(
+        y_matrix, d_matrix, control_mask, time_dist,
+        n_periods, n_units,
+        lambda_time_grid, lambda_time_len,
+        lambda_unit_grid, lambda_unit_len,
+        lambda_nn_grid, lambda_nn_len,
+        max_iter, tol,
+        &best_time, &best_unit, &best_nn, &best_score,
+        &n_valid, &n_attempted,
+        &first_failed_t, &first_failed_i
+    );
+
+    if (rust_rc != TROP_SUCCESS) {
+        translate_error_code(rust_rc);
+        rc = rust_rc;
+        goto cleanup;
+    }
+
+    /* Write results (identical schema to handle_loocv_twostep) */
+    SF_scal_save("__trop_lambda_time", best_time);
+    SF_scal_save("__trop_lambda_unit", best_unit);
+    SF_scal_save("__trop_lambda_nn", best_nn);
+    SF_scal_save("__trop_loocv_score", best_score);
+    SF_scal_save("__trop_loocv_n_valid", (double)n_valid);
+    SF_scal_save("__trop_loocv_n_attempted", (double)n_attempted);
+    SF_scal_save("__trop_loocv_first_failed_t", (double)first_failed_t);
+    SF_scal_save("__trop_loocv_first_failed_i", (double)first_failed_i);
+
+    TROP_LOG_INFO("LOOCV exhaustive complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, first_failed=(%d,%d)",
+                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, first_failed_t, first_failed_i);
+
+    rc = TROP_SUCCESS;
+
+cleanup:
+    free(y_matrix);
+    free(d_matrix);
+    free(control_mask);
+    free(time_dist);
+    free(lambda_time_grid);
+    free(lambda_unit_grid);
+    free(lambda_nn_grid);
+
     return rc;
 }
 
@@ -687,11 +835,15 @@ static ST_retcode handle_loocv_joint(void) {
     double best_time, best_unit, best_nn, best_score;
     int n_valid, n_attempted;
     int first_failed_t, first_failed_i;  /* first failed LOOCV observation indices */
+    double stage1_time, stage1_unit, stage1_nn;  /* Stage-1 univariate init (Footnote 2) */
     ST_retcode rc;
     int rust_rc;
     
     first_failed_t = -1;
     first_failed_i = -1;
+    stage1_time = 0.0;
+    stage1_unit = 0.0;
+    stage1_nn = 0.0;
     
     TROP_LOG_INFO("starting LOOCV cycling search (joint)");
     
@@ -758,7 +910,8 @@ static ST_retcode handle_loocv_joint(void) {
         10, /* max_cycles: coordinate descent iterations */
         &best_time, &best_unit, &best_nn, &best_score,
         &n_valid, &n_attempted,
-        &first_failed_t, &first_failed_i
+        &first_failed_t, &first_failed_i,
+        &stage1_time, &stage1_unit, &stage1_nn
     );
     
     if (rust_rc != TROP_SUCCESS) {
@@ -778,9 +931,14 @@ static ST_retcode handle_loocv_joint(void) {
     /* First failed observation indices (for diagnostics) */
     SF_scal_save("__trop_loocv_first_failed_t", (double)first_failed_t);
     SF_scal_save("__trop_loocv_first_failed_i", (double)first_failed_i);
+    /* Stage-1 univariate init (paper Footnote 2); cycling path only. */
+    SF_scal_save("__trop_stage1_lambda_time", stage1_time);
+    SF_scal_save("__trop_stage1_lambda_unit", stage1_unit);
+    SF_scal_save("__trop_stage1_lambda_nn", stage1_nn);
     
-    TROP_LOG_INFO("LOOCV complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, first_failed=(%d,%d)",
-                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, first_failed_t, first_failed_i);
+    TROP_LOG_INFO("LOOCV complete: lambda_time=%g, lambda_unit=%g, lambda_nn=%g, score=%g, n_valid=%d, n_attempted=%d, first_failed=(%d,%d), stage1=(%g,%g,%g)",
+                  best_time, best_unit, best_nn, best_score, n_valid, n_attempted, first_failed_t, first_failed_i,
+                  stage1_time, stage1_unit, stage1_nn);
     
     rc = TROP_SUCCESS;
     
@@ -943,6 +1101,10 @@ static ST_retcode handle_estimate_twostep(void) {
     double *l_matrix = NULL;
     int *converged_by_obs = NULL;
     int *n_iters_by_obs = NULL;
+    double *unit_weights = NULL;
+    int unit_weights_len = 0;
+    int use_weights = 0;
+    double use_weights_d = 0.0;
     double lambda_time, lambda_unit, lambda_nn;
     double max_iter_d, tol;
     int max_iter;
@@ -1009,17 +1171,47 @@ static ST_retcode handle_estimate_twostep(void) {
     
     TROP_LOG_DEBUG("estimate params: lambda_time=%g, lambda_unit=%g, lambda_nn=%g",
                    lambda_time, lambda_unit, lambda_nn);
-    
-    /* Call Rust function */
-    rust_rc = stata_estimate_twostep(
-        y_matrix, d_matrix, control_mask, time_dist,
-        n_periods, n_units,
-        lambda_time, lambda_unit, lambda_nn,
-        max_iter, tol,
-        &att, tau, alpha, beta, l_matrix,
-        &n_treated, &n_iterations, &converged,
-        converged_by_obs, n_iters_by_obs
-    );
+
+    /* Optional pweight path.  __trop_use_weights == 1 triggers the weighted
+     * ATT aggregation; __trop_unit_weights is a N×1 column matrix with
+     * strictly positive per-unit pweights (validated Mata-side). */
+    if (SF_scal_use("__trop_use_weights", &use_weights_d) == 0) {
+        use_weights = ((int)use_weights_d != 0) ? 1 : 0;
+    }
+    if (use_weights) {
+        rc = read_lambda_grid("__trop_unit_weights", &unit_weights, &unit_weights_len);
+        if (rc != TROP_SUCCESS) goto cleanup;
+        if (unit_weights_len != (int)n_units) {
+            TROP_LOG_ERROR("unit_weights length %d != n_units %d",
+                           unit_weights_len, (int)n_units);
+            rc = TROP_ERR_INVALID_DIM;
+            goto cleanup;
+        }
+    }
+
+    /* Call Rust function (weighted or unweighted) */
+    if (use_weights) {
+        rust_rc = stata_estimate_twostep_weighted(
+            y_matrix, d_matrix, control_mask, time_dist,
+            n_periods, n_units,
+            lambda_time, lambda_unit, lambda_nn,
+            max_iter, tol,
+            &att, tau, alpha, beta, l_matrix,
+            &n_treated, &n_iterations, &converged,
+            converged_by_obs, n_iters_by_obs,
+            unit_weights
+        );
+    } else {
+        rust_rc = stata_estimate_twostep(
+            y_matrix, d_matrix, control_mask, time_dist,
+            n_periods, n_units,
+            lambda_time, lambda_unit, lambda_nn,
+            max_iter, tol,
+            &att, tau, alpha, beta, l_matrix,
+            &n_treated, &n_iterations, &converged,
+            converged_by_obs, n_iters_by_obs
+        );
+    }
     
     if (rust_rc != TROP_SUCCESS) {
         translate_error_code(rust_rc);
@@ -1161,6 +1353,7 @@ cleanup:
     free(l_matrix);
     free(converged_by_obs);
     free(n_iters_by_obs);
+    free(unit_weights);
     
     return rc;
 }
@@ -1177,6 +1370,10 @@ static ST_retcode handle_estimate_joint(void) {
     double *beta = NULL;
     double *l_matrix = NULL;
     double *tau_vec = NULL;
+    double *unit_weights = NULL;
+    int unit_weights_len = 0;
+    int use_weights = 0;
+    double use_weights_d = 0.0;
     double lambda_time, lambda_unit, lambda_nn;
     double max_iter_d, tol;
     int max_iter;
@@ -1226,17 +1423,45 @@ static ST_retcode handle_estimate_joint(void) {
     SF_scal_use("__trop_tol", &tol);
     
     max_iter = (int)max_iter_d;
-    
-    /* Call Rust function */
-    rust_rc = stata_estimate_joint(
-        y_matrix, d_matrix,
-        n_periods, n_units,
-        lambda_time, lambda_unit, lambda_nn,
-        max_iter, tol,
-        &tau, &mu, alpha, beta, l_matrix,
-        &n_iterations, &converged,
-        tau_vec, &n_treated_cells
-    );
+
+    /* Optional pweight path — see handle_estimate_twostep for protocol. */
+    if (SF_scal_use("__trop_use_weights", &use_weights_d) == 0) {
+        use_weights = ((int)use_weights_d != 0) ? 1 : 0;
+    }
+    if (use_weights) {
+        rc = read_lambda_grid("__trop_unit_weights", &unit_weights, &unit_weights_len);
+        if (rc != TROP_SUCCESS) goto cleanup;
+        if (unit_weights_len != (int)n_units) {
+            TROP_LOG_ERROR("unit_weights length %d != n_units %d",
+                           unit_weights_len, (int)n_units);
+            rc = TROP_ERR_INVALID_DIM;
+            goto cleanup;
+        }
+    }
+
+    /* Call Rust function (weighted or unweighted) */
+    if (use_weights) {
+        rust_rc = stata_estimate_joint_weighted(
+            y_matrix, d_matrix,
+            n_periods, n_units,
+            lambda_time, lambda_unit, lambda_nn,
+            max_iter, tol,
+            &tau, &mu, alpha, beta, l_matrix,
+            &n_iterations, &converged,
+            tau_vec, &n_treated_cells,
+            unit_weights
+        );
+    } else {
+        rust_rc = stata_estimate_joint(
+            y_matrix, d_matrix,
+            n_periods, n_units,
+            lambda_time, lambda_unit, lambda_nn,
+            max_iter, tol,
+            &tau, &mu, alpha, beta, l_matrix,
+            &n_iterations, &converged,
+            tau_vec, &n_treated_cells
+        );
+    }
     
     if (rust_rc != TROP_SUCCESS) {
         translate_error_code(rust_rc);
@@ -1347,6 +1572,7 @@ cleanup:
     free(beta);
     free(l_matrix);
     free(tau_vec);
+    free(unit_weights);
     
     return rc;
 }
@@ -1363,9 +1589,13 @@ static ST_retcode handle_bootstrap_twostep(void) {
     unsigned char *control_mask = NULL;
     int64_t *time_dist = NULL;
     double *estimates = NULL;
+    double *unit_weights = NULL;
+    int unit_weights_len = 0;
+    int use_weights = 0;
+    double use_weights_d = 0.0;
     double lambda_time, lambda_unit, lambda_nn;
-    double n_bootstrap_d, max_iter_d, tol, seed_d, alpha_d;
-    int n_bootstrap, max_iter;
+    double n_bootstrap_d, max_iter_d, tol, seed_d, alpha_d, ddof_d;
+    int n_bootstrap, max_iter, ddof;
     uint64_t seed;
     double se, alpha;
     double ci_lower_pct, ci_upper_pct;  /* percentile CI from bootstrap distribution */
@@ -1389,6 +1619,14 @@ static ST_retcode handle_bootstrap_twostep(void) {
         alpha = 0.05;  /* Default to 95% CI */
     } else {
         alpha = alpha_d;
+    }
+
+    /* Variance-denominator selector: 1 = sample (1/(B-1)), 0 = paper Alg 3
+     * population (1/B).  Absent scalar defaults to 1 for backward compat. */
+    if (SF_scal_use("__trop_bs_ddof", &ddof_d) != 0) {
+        ddof = 1;
+    } else {
+        ddof = ((int)ddof_d == 0) ? 0 : 1;
     }
     
     /* Allocate memory */
@@ -1433,17 +1671,43 @@ static ST_retcode handle_bootstrap_twostep(void) {
     max_iter = (int)max_iter_d;
     seed = (uint64_t)seed_d;
     
-    TROP_LOG_DEBUG("bootstrap params: n_bootstrap=%d, seed=%llu, alpha=%g",
-                   n_bootstrap, (unsigned long long)seed, alpha);
-    
-    /* Call Rust bootstrap function */
-    rust_rc = stata_bootstrap_trop_variance(
-        y_matrix, d_matrix, control_mask, time_dist,
-        n_periods, n_units,
-        lambda_time, lambda_unit, lambda_nn,
-        n_bootstrap, max_iter, tol, seed, alpha,
-        estimates, &se, &ci_lower_pct, &ci_upper_pct, &n_valid
-    );
+    TROP_LOG_DEBUG("bootstrap params: n_bootstrap=%d, seed=%llu, alpha=%g, ddof=%d",
+                   n_bootstrap, (unsigned long long)seed, alpha, ddof);
+
+    /* Optional pweight path — see handle_estimate_twostep for protocol. */
+    if (SF_scal_use("__trop_use_weights", &use_weights_d) == 0) {
+        use_weights = ((int)use_weights_d != 0) ? 1 : 0;
+    }
+    if (use_weights) {
+        rc = read_lambda_grid("__trop_unit_weights", &unit_weights, &unit_weights_len);
+        if (rc != TROP_SUCCESS) goto cleanup;
+        if (unit_weights_len != (int)n_units) {
+            TROP_LOG_ERROR("unit_weights length %d != n_units %d",
+                           unit_weights_len, (int)n_units);
+            rc = TROP_ERR_INVALID_DIM;
+            goto cleanup;
+        }
+    }
+
+    /* Call Rust bootstrap function (weighted or unweighted) */
+    if (use_weights) {
+        rust_rc = stata_bootstrap_trop_variance_weighted(
+            y_matrix, d_matrix, control_mask, time_dist,
+            n_periods, n_units,
+            lambda_time, lambda_unit, lambda_nn,
+            n_bootstrap, max_iter, tol, seed, alpha, ddof,
+            estimates, &se, &ci_lower_pct, &ci_upper_pct, &n_valid,
+            unit_weights
+        );
+    } else {
+        rust_rc = stata_bootstrap_trop_variance(
+            y_matrix, d_matrix, control_mask, time_dist,
+            n_periods, n_units,
+            lambda_time, lambda_unit, lambda_nn,
+            n_bootstrap, max_iter, tol, seed, alpha, ddof,
+            estimates, &se, &ci_lower_pct, &ci_upper_pct, &n_valid
+        );
+    }
     
     if (rust_rc != TROP_SUCCESS) {
         translate_error_code(rust_rc);
@@ -1487,6 +1751,7 @@ cleanup:
     free(control_mask);
     free(time_dist);
     free(estimates);
+    free(unit_weights);
     
     return rc;
 }
@@ -1500,9 +1765,13 @@ static ST_retcode handle_bootstrap_joint(void) {
     double *y_matrix = NULL;
     double *d_matrix = NULL;
     double *estimates = NULL;
+    double *unit_weights = NULL;
+    int unit_weights_len = 0;
+    int use_weights = 0;
+    double use_weights_d = 0.0;
     double lambda_time, lambda_unit, lambda_nn;
-    double n_bootstrap_d, max_iter_d, tol, seed_d, alpha_d;
-    int n_bootstrap, max_iter;
+    double n_bootstrap_d, max_iter_d, tol, seed_d, alpha_d, ddof_d;
+    int n_bootstrap, max_iter, ddof;
     uint64_t seed;
     double se, alpha;
     double ci_lower_pct, ci_upper_pct;  /* percentile CI from bootstrap distribution */
@@ -1526,6 +1795,14 @@ static ST_retcode handle_bootstrap_joint(void) {
         alpha = 0.05;  /* Default to 95% CI */
     } else {
         alpha = alpha_d;
+    }
+
+    /* Variance-denominator selector: 1 = sample (1/(B-1)), 0 = paper Alg 3
+     * population (1/B).  Absent scalar defaults to 1 for backward compat. */
+    if (SF_scal_use("__trop_bs_ddof", &ddof_d) != 0) {
+        ddof = 1;
+    } else {
+        ddof = ((int)ddof_d == 0) ? 0 : 1;
     }
     
     /* Allocate memory */
@@ -1561,17 +1838,43 @@ static ST_retcode handle_bootstrap_joint(void) {
     max_iter = (int)max_iter_d;
     seed = (uint64_t)seed_d;
     
-    TROP_LOG_DEBUG("bootstrap params: n_bootstrap=%d, seed=%llu, alpha=%g",
-                   n_bootstrap, (unsigned long long)seed, alpha);
-    
-    /* Call Rust bootstrap function */
-    rust_rc = stata_bootstrap_trop_variance_joint(
-        y_matrix, d_matrix,
-        n_periods, n_units,
-        lambda_time, lambda_unit, lambda_nn,
-        n_bootstrap, max_iter, tol, seed, alpha,
-        estimates, &se, &ci_lower_pct, &ci_upper_pct, &n_valid
-    );
+    TROP_LOG_DEBUG("bootstrap params: n_bootstrap=%d, seed=%llu, alpha=%g, ddof=%d",
+                   n_bootstrap, (unsigned long long)seed, alpha, ddof);
+
+    /* Optional pweight path — see handle_estimate_twostep for protocol. */
+    if (SF_scal_use("__trop_use_weights", &use_weights_d) == 0) {
+        use_weights = ((int)use_weights_d != 0) ? 1 : 0;
+    }
+    if (use_weights) {
+        rc = read_lambda_grid("__trop_unit_weights", &unit_weights, &unit_weights_len);
+        if (rc != TROP_SUCCESS) goto cleanup;
+        if (unit_weights_len != (int)n_units) {
+            TROP_LOG_ERROR("unit_weights length %d != n_units %d",
+                           unit_weights_len, (int)n_units);
+            rc = TROP_ERR_INVALID_DIM;
+            goto cleanup;
+        }
+    }
+
+    /* Call Rust bootstrap function (weighted or unweighted) */
+    if (use_weights) {
+        rust_rc = stata_bootstrap_trop_variance_joint_weighted(
+            y_matrix, d_matrix,
+            n_periods, n_units,
+            lambda_time, lambda_unit, lambda_nn,
+            n_bootstrap, max_iter, tol, seed, alpha, ddof,
+            estimates, &se, &ci_lower_pct, &ci_upper_pct, &n_valid,
+            unit_weights
+        );
+    } else {
+        rust_rc = stata_bootstrap_trop_variance_joint(
+            y_matrix, d_matrix,
+            n_periods, n_units,
+            lambda_time, lambda_unit, lambda_nn,
+            n_bootstrap, max_iter, tol, seed, alpha, ddof,
+            estimates, &se, &ci_lower_pct, &ci_upper_pct, &n_valid
+        );
+    }
     
     if (rust_rc != TROP_SUCCESS) {
         translate_error_code(rust_rc);
@@ -1613,6 +1916,7 @@ cleanup:
     free(y_matrix);
     free(d_matrix);
     free(estimates);
+    free(unit_weights);
     
     return rc;
 }
@@ -1729,7 +2033,11 @@ STDLL stata_call(int argc, char *argv[]) {
         case CMD_LOOCV_TWOSTEP:
             rc = handle_loocv_twostep();
             break;
-            
+
+        case CMD_LOOCV_TWOSTEP_EXHAUSTIVE:
+            rc = handle_loocv_twostep_exhaustive();
+            break;
+
         case CMD_LOOCV_JOINT:
             rc = handle_loocv_joint();
             break;

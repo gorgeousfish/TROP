@@ -85,8 +85,5 @@ qui do "`base_path'/mata/trop_loocv_validation.mata"
 qui do "`base_path'/mata/trop_bootstrap_diagnostics.mata"
 qui do "`base_path'/mata/trop_estat_helpers.mata"
 
-// Level 4b: estimator core module
-capture qui do "`base_path'/mata/trop_estimator_core.mata"
-
 // Level 5: main entry point (depends on levels 2-4)
 qui do "`base_path'/mata/trop_main.mata"              // depends on data_transfer, rust_interface, ereturn_store

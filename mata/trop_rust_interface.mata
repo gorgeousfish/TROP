@@ -19,9 +19,10 @@
        trop_rust_available()          query plugin availability
 
   2. LOOCV interface
-       trop_loocv_twostep()             two-step LOOCV grid search
-       trop_loocv_joint()               joint LOOCV coordinate-descent search
-       trop_loocv_joint_exhaustive()    joint LOOCV Cartesian grid search
+       trop_loocv_twostep()               two-step LOOCV cycling search
+       trop_loocv_twostep_exhaustive()    two-step LOOCV Cartesian grid search
+       trop_loocv_joint()                 joint LOOCV coordinate-descent search
+       trop_loocv_joint_exhaustive()      joint LOOCV Cartesian grid search
 
   3. Estimation interface
        trop_estimate_twostep()        two-step point estimation
@@ -300,6 +301,24 @@ real scalar trop_loocv_twostep()
 }
 
 /*──────────────────────────────────────────────────────────────────────────────
+  trop_loocv_twostep_exhaustive()
+
+  Two-step LOOCV exhaustive (Cartesian) grid search.
+
+  Evaluates every (lambda_time, lambda_unit, lambda_nn) combination in
+  parallel; complexity is O(|Lambda_time| * |Lambda_unit| * |Lambda_nn|).
+  Guarantees the global grid minimum under the tie-breaker rules, at the
+  cost of higher computation for large grids.
+
+  Returns 0 on success.
+──────────────────────────────────────────────────────────────────────────────*/
+
+real scalar trop_loocv_twostep_exhaustive()
+{
+    return(_trop_call_plugin("loocv_twostep_exhaustive"))
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
   trop_loocv_joint()
 
   Joint LOOCV coordinate-descent search (default).
@@ -324,7 +343,7 @@ real scalar trop_loocv_joint()
 
   Evaluates every (lambda_time, lambda_unit, lambda_nn) combination in
   parallel; complexity is O(|Lambda_time| * |Lambda_unit| * |Lambda_nn|).
-  Matches the Python reference (diff_diff.trop_global, v3.1.1) exactly.
+  Guarantees the exact grid argmin of Q(lambda) over the supplied grids.
 
   Returns 0 on success.
 ──────────────────────────────────────────────────────────────────────────────*/
@@ -489,20 +508,36 @@ void store_loocv_diagnostics(
 
   Inspects e(loocv_fail_rate) and acts accordingly:
     > 50%    abort with rc 498 (results unreliable)
-    > 10%    issue a warning, continue
-    <= 10%   silent
+    >  5%    issue a warning, continue
+    <= 5%    silent
+
+  The 5 % warning threshold mirrors `_trop_display_bootstrap_warnings()`
+  so LOOCV and bootstrap surface failures at the same sensitivity.  On a
+  panel with ~1,000 D=0 cells a 5 % LOOCV failure rate means ~50 leave-
+  one-out fits did not converge, which is enough to bias the selected
+  λ triple off of Q(λ)'s true argmin (paper Eq. 5).  The 50 % abort
+  threshold is retained as a stronger user protection.
 
   Returns 0 to continue, 498 to abort.
 ──────────────────────────────────────────────────────────────────────────────*/
 
 real scalar check_loocv_fail_rate()
 {
-    real scalar fail_rate, first_t, first_i
+    real scalar fail_rate, first_t, first_i, n_valid, n_attempted
+    real scalar lt, lu, ln
     real matrix temp
+    string scalar ln_str
 
     temp = st_numscalar("e(loocv_fail_rate)")
     if (rows(temp) == 0) return(0)
     fail_rate = temp
+
+    n_valid = .
+    n_attempted = .
+    temp = st_numscalar("e(loocv_n_valid)")
+    if (rows(temp) > 0) n_valid = temp
+    temp = st_numscalar("e(loocv_n_attempted)")
+    if (rows(temp) > 0) n_attempted = temp
 
     first_t = .
     first_i = .
@@ -511,27 +546,66 @@ real scalar check_loocv_fail_rate()
     temp = st_numscalar("e(loocv_first_failed_i)")
     if (rows(temp) > 0) first_i = temp
 
+    /* Selected lambda triple.  e(lambda_nn) is the user-face scalar
+       (+Inf shows as Stata missing); render it as "+Inf" to avoid an
+       ambiguous ".".  All three scalars may be missing when LOOCV was
+       skipped via fixedlambda(), in which case the helper lines below
+       are omitted entirely. */
+    lt = .
+    lu = .
+    ln = .
+    temp = st_numscalar("e(lambda_time)")
+    if (rows(temp) > 0) lt = temp
+    temp = st_numscalar("e(lambda_unit)")
+    if (rows(temp) > 0) lu = temp
+    temp = st_numscalar("e(lambda_nn)")
+    if (rows(temp) > 0) ln = temp
+    ln_str = (ln >= . ? "+Inf" : strofreal(ln, "%10.4g"))
+
     if (fail_rate > 0.50) {
-        errprintf("LOOCV failure rate too high: %5.1f%%\n", fail_rate * 100)
-        errprintf("results would be unreliable; check data quality\n")
+        errprintf("Error: LOOCV failure rate exceeds 50%% (%5.1f%%)\n",
+                  fail_rate * 100)
+        if (n_valid < . & n_attempted < .) {
+            errprintf("       %g of %g leave-one-out fits failed.\n",
+                      n_attempted - n_valid, n_attempted)
+        }
+        if (lt < . & lu < .) {
+            errprintf(
+                "       Selected lambda: (time=%10.4g, unit=%10.4g, nn=%s).\n",
+                lt, lu, ln_str)
+        }
+        errprintf("       Results would be unreliable; check data quality.\n")
         if (first_t != . & first_i != . & first_t >= 0 & first_i >= 0) {
             /* Rust indices are 0-based; display 1-based to match Stata. */
             errprintf(
-                "first failing LOO fit: period %g, unit %g (1-based);\n",
+                "       First failing LOO fit: period %g, unit %g (1-based);\n",
                 first_t + 1, first_i + 1)
             errprintf(
-                "  cross-reference e(panelvar), e(timevar), and the estimation sample\n")
+                "       cross-reference e(panelvar), e(timevar), and the estimation sample.\n")
         }
         return(498)
     }
-    if (fail_rate > 0.10) {
-        printf("{txt}warning: LOOCV failure rate is %5.1f%%\n", fail_rate * 100)
+    if (fail_rate > 0.05) {
+        if (n_valid < . & n_attempted < .) {
+            printf("{res}Warning: LOOCV failure rate is %5.1f%% (%g/%g successful){txt}\n",
+                   fail_rate * 100, n_valid, n_attempted)
+        }
+        else {
+            printf("{res}Warning: LOOCV failure rate is %5.1f%%{txt}\n",
+                   fail_rate * 100)
+        }
+        if (lt < . & lu < .) {
+            printf(
+                "{txt}         Selected lambda: (time={res}%10.4g{txt}, unit={res}%10.4g{txt}, nn={res}%s{txt}).\n",
+                lt, lu, ln_str)
+        }
+        printf("{res}         Selected lambda may be off the true Q(lambda) argmin.{txt}\n")
         if (first_t != . & first_i != . & first_t >= 0 & first_i >= 0) {
             printf(
-                "{txt}  first failing LOO fit at period %g, unit %g (1-based);\n",
+                "{txt}         First failing LOO fit: period %g, unit %g (1-based);\n",
                 first_t + 1, first_i + 1)
             printf(
-                "{txt}  see e(loocv_first_failed_t), e(loocv_first_failed_i)\n")
+                "{txt}         see e(loocv_first_failed_t), e(loocv_first_failed_i).\n")
         }
     }
 
@@ -591,6 +665,12 @@ void display_loocv_verbose()
     do_bootstrap     1 to run bootstrap, 0 to skip
     bootstrap_reps   number of bootstrap replications
 
+  Optional argument
+    ddof             variance denominator selector forwarded to the
+                     bootstrap plugin: 1 = sample variance 1/(B-1)
+                     (default); 0 = paper Algorithm 3 population
+                     variance 1/B.  Any other value collapses to 1.
+
   Returns 0 on success.
 ──────────────────────────────────────────────────────────────────────────────*/
 
@@ -598,12 +678,13 @@ real scalar _trop_main(
     string scalar method,
     real scalar do_loocv,
     real scalar do_bootstrap,
-    real scalar bootstrap_reps)
+    real scalar bootstrap_reps,
+    | real scalar ddof)
 {
     real scalar rc
     real scalar lambda_time, lambda_unit, lambda_nn
-    real scalar max_iter, tol, seed, alpha_level
-    string scalar joint_mode
+    real scalar max_iter, tol, seed, alpha_level, ddof_eff
+    string scalar joint_mode, twostep_mode
 
     /* ── plugin check ────────────────────────────────────────────────── */
     if (!trop_rust_available()) {
@@ -614,7 +695,14 @@ real scalar _trop_main(
     /* ── LOOCV ───────────────────────────────────────────────────────── */
     if (do_loocv) {
         if (method == "twostep") {
-            rc = trop_loocv_twostep()
+            /* twostep: dispatch on __trop_twostep_loocv_mode.
+               "exhaustive" -> full Cartesian search (guaranteed global
+               minimum, O(|grid|^3));
+               anything else (including missing) -> coordinate-descent
+               cycling search (faster, may hit local minima). */
+            twostep_mode = st_global("__trop_twostep_loocv_mode")
+            if (twostep_mode == "exhaustive") rc = trop_loocv_twostep_exhaustive()
+            else rc = trop_loocv_twostep()
         }
         else {
             /* joint: dispatch on __trop_joint_loocv_mode.
@@ -642,10 +730,22 @@ real scalar _trop_main(
         seed        = st_numscalar("__trop_seed")
         alpha_level = st_numscalar("__trop_alpha_level")
 
-        trop_prepare_bootstrap(
-            bootstrap_reps, alpha_level, seed,
-            lambda_time, lambda_unit, lambda_nn,
-            max_iter, tol)
+        /* ddof is forwarded only when the caller supplied a finite value;
+           otherwise trop_prepare_bootstrap leaves __trop_bs_ddof unset and
+           the plugin applies its default (sample variance, 1/(B-1)). */
+        if (args() >= 5 & ddof < .) {
+            ddof_eff = (ddof == 0) ? 0 : 1
+            trop_prepare_bootstrap(
+                bootstrap_reps, alpha_level, seed,
+                lambda_time, lambda_unit, lambda_nn,
+                max_iter, tol, ddof_eff)
+        }
+        else {
+            trop_prepare_bootstrap(
+                bootstrap_reps, alpha_level, seed,
+                lambda_time, lambda_unit, lambda_nn,
+                max_iter, tol)
+        }
 
         if (method == "twostep") rc = trop_bootstrap_twostep()
         else rc = trop_bootstrap_joint()

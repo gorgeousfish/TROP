@@ -87,9 +87,28 @@ program define _display_grid_sensitivity
     local opt_nn = e(lambda_nn)
     local opt_score = e(loocv_score)
     local method = "`e(method)'"
+    local loocv_mode ""
 
-    di as txt "Method: " as res "`method'"
-    di as txt "LOOCV search: coordinate descent (cycling)"
+    if "`method'" == "joint" {
+        local loocv_mode "`e(joint_loocv)'"
+        if "`loocv_mode'" == "" local loocv_mode "exhaustive"
+        di as txt "Method: " as res "joint" ///
+            as txt " (Remark 6.1 extension; shared tau)"
+    }
+    else {
+        local loocv_mode "`e(twostep_loocv)'"
+        if "`loocv_mode'" == "" local loocv_mode "cycling"
+        di as txt "Method: " as res "twostep" ///
+            as txt " (Algorithm 2 default; heterogeneous tau_it)"
+    }
+    if "`loocv_mode'" == "exhaustive" {
+        di as txt "LOOCV search: " as res "exhaustive" ///
+            as txt " (Cartesian product; guaranteed grid argmin)"
+    }
+    else {
+        di as txt "LOOCV search: " as res "cycling" ///
+            as txt " (coordinate descent)"
+    }
     di as txt ""
 
     // Display grid summary table
@@ -125,8 +144,13 @@ program define _display_grid_sensitivity
     if _rc == 0 {
         di as txt ""
         di as txt "Grid space (Cartesian product): " as res `= rowsof(e(lambda_grid))' as txt " combinations"
-        di as txt "Note: Coordinate descent (cycling) evaluates O(|grid| x cycles) points,"
-        di as txt "      not the full Cartesian product."
+        if "`loocv_mode'" == "cycling" {
+            di as txt "Note: Coordinate descent (cycling) evaluates O(|grid| x cycles) points,"
+            di as txt "      not the full Cartesian product."
+        }
+        else {
+            di as txt "Note: Exhaustive LOOCV evaluates the full Cartesian product."
+        }
     }
 end
 

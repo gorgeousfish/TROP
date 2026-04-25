@@ -167,8 +167,10 @@ end
 version 17
 mata:
 
-// Linear interpolation percentile calculation, consistent with Rust interpolate_percentile() and NumPy np.percentile()
-// Use (n-1)*p method: index = (n-1)*p, linear interpolation between adjacent elements
+// Linear interpolation percentile (consistent with the Rust core's
+// interpolate_percentile()).  Uses the (n-1)*p convention: the fractional
+// index idx = (n-1)*p is linearly interpolated between adjacent order
+// statistics.
 real scalar _trop_interpolate_percentile(real colvector sorted_vec, real scalar p)
 {
     real scalar n, idx_f, idx_low, idx_high, frac
@@ -202,13 +204,15 @@ void _trop_estat_bootstrap_display(real colvector boot_est,
     real scalar B, B_total, median_val, iqr_val
     real scalar q25, q75, q025, q05, q95, q975
     real scalar jb_stat, jb_p
+    real scalar fail_pct
     real colvector sorted_boot, boot_valid
     
     // Filter out missing values from bootstrap estimates.
     // The bootstrap_estimates matrix is pre-allocated as J(n_bootstrap, 1, .)
     // and C bridge only writes n_valid rows. Remaining rows stay as missing,
     // which causes mean()/variance() to propagate missing → all stats become NaN.
-    // The reference implementation only returns valid estimates (never includes missing).
+    // Distribution statistics must be computed on valid estimates only;
+    // including missing placeholders would propagate NaN.
     B_total = rows(boot_est)
     boot_valid = select(boot_est, boot_est :< .)
     B = rows(boot_valid)
@@ -230,7 +234,8 @@ void _trop_estat_bootstrap_display(real colvector boot_est,
     // Sort for percentile calculation
     sorted_boot = sort(boot_valid, 1)
     
-    // Calculate percentiles — use (n-1)*p linear interpolation, consistent with Rust/NumPy
+    // Calculate percentiles — use (n-1)*p linear interpolation,
+    // consistent with the Rust core's interpolate_percentile().
     q025 = _trop_interpolate_percentile(sorted_boot, 0.025)
     q05 = _trop_interpolate_percentile(sorted_boot, 0.05)
     q25 = _trop_interpolate_percentile(sorted_boot, 0.25)
@@ -250,6 +255,17 @@ void _trop_estat_bootstrap_display(real colvector boot_est,
     printf("{txt}Bootstrap samples:  B = {res}%g\n", B)
     printf("{txt}Requested samples:  {res}%g\n", boot_reps)
     printf("{txt}Valid samples:      {res}%g{txt} / {res}%g{txt} ({res}%5.1f%%{txt})\n", B, boot_reps, 100*B/boot_reps)
+    /* Surface the failure rate symmetrically with `estat loocv`:
+       > 5% prints an advisory note reminding users that SEs may be
+       less reliable.  The exact threshold is set in
+       `_trop_display_bootstrap_warnings` (`mata/trop_ereturn_store.mata`). */
+    if (B < boot_reps) {
+        fail_pct = 100 * (boot_reps - B) / boot_reps
+        printf("{txt}Bootstrap fail rate: {res}%5.1f%%\n", fail_pct)
+        if (fail_pct > 5.0) {
+            printf("{txt}  note: > 5%% of replicates failed; SEs may be less reliable.\n")
+        }
+    }
     printf("\n")
     
     // ========== Display ATT distribution statistics ==========

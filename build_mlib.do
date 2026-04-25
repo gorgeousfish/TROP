@@ -84,7 +84,6 @@ local mata_files ///
     "trop_loocv_validation.mata" ///
     "trop_bootstrap_diagnostics.mata" ///
     "trop_estat_helpers.mata" ///
-    "trop_estimator_core.mata" ///
     "trop_main.mata"
 
 local error_count = 0

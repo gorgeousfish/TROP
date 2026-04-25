@@ -73,7 +73,7 @@ end
 ==============================================================================*/
 program define _estat_weights_twostep
     di as txt ""
-    di as txt "Weight Distribution (Twostep Method)"
+    di as txt "Weight Distribution (Twostep; Algorithm 2 default)"
     di as txt "{hline 61}"
     di as txt "Note: Weights vary by treated observation. Showing statistics"
     di as txt "      for first treated observation."
@@ -124,7 +124,7 @@ end
 ==============================================================================*/
 program define _estat_weights_joint
     di as txt ""
-    di as txt "Weight Distribution (Joint Method)"
+    di as txt "Weight Distribution (Joint; shared-tau extension)"
     di as txt "{hline 61}"
     
     capture confirm matrix e(delta_time)

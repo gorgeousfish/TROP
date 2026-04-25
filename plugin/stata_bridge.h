@@ -52,6 +52,7 @@
 
 typedef enum {
     CMD_LOOCV_TWOSTEP,
+    CMD_LOOCV_TWOSTEP_EXHAUSTIVE,
     CMD_LOOCV_JOINT,
     CMD_LOOCV_JOINT_EXHAUSTIVE,
     CMD_ESTIMATE_TWOSTEP,
@@ -128,9 +129,53 @@ extern "C" {
  * @param n_attempted_out       [out] Total finite control observations (nullable)
  * @param first_failed_t_out    [out] Period of first failed fit, -1 if none (nullable)
  * @param first_failed_i_out    [out] Unit of first failed fit, -1 if none (nullable)
+ * @param stage1_lambda_time_out [out] Stage-1 univariate initial lambda_time (nullable; Footnote 2)
+ * @param stage1_lambda_unit_out [out] Stage-1 univariate initial lambda_unit (nullable)
+ * @param stage1_lambda_nn_out   [out] Stage-1 univariate initial lambda_nn (nullable)
  * @return 0 on success, nonzero error code otherwise
  */
 extern int stata_loocv_grid_search(
+    const double *y_ptr,
+    const double *d_ptr,
+    const unsigned char *control_mask_ptr,
+    const int64_t *time_dist_ptr,
+    int n_periods,
+    int n_units,
+    const double *lambda_time_grid_ptr,
+    int lambda_time_grid_len,
+    const double *lambda_unit_grid_ptr,
+    int lambda_unit_grid_len,
+    const double *lambda_nn_grid_ptr,
+    int lambda_nn_grid_len,
+    int max_iter,
+    double tol,
+    double *best_lambda_time_out,
+    double *best_lambda_unit_out,
+    double *best_lambda_nn_out,
+    double *best_score_out,
+    int *n_valid_out,
+    int *n_attempted_out,
+    int *first_failed_t_out,
+    int *first_failed_i_out,
+    double *stage1_lambda_time_out,
+    double *stage1_lambda_unit_out,
+    double *stage1_lambda_nn_out
+);
+
+/**
+ * Exhaustive (Cartesian) LOOCV grid search for the Twostep estimator.
+ *
+ * Evaluates every (lambda_time, lambda_unit, lambda_nn) combination in
+ * parallel and returns the global grid minimum under the LOOCV criterion
+ * Q(lambda).  Complexity is O(|grid|^3); for large grids the
+ * coordinate-descent variant stata_loocv_grid_search is typically preferred.
+ *
+ * Parameters and return value are identical to stata_loocv_grid_search().
+ * On small panels (N or T small) the exhaustive path is immune to the local
+ * minima that the cycling path can encounter when Q(lambda) is non-convex,
+ * which is the source of platform- and BLAS-dependent lambda drift.
+ */
+extern int stata_loocv_grid_search_exhaustive(
     const double *y_ptr,
     const double *d_ptr,
     const unsigned char *control_mask_ptr,
@@ -191,7 +236,10 @@ extern int stata_loocv_cycling_search_joint(
     int *n_valid_out,
     int *n_attempted_out,
     int *first_failed_t_out,
-    int *first_failed_i_out
+    int *first_failed_i_out,
+    double *stage1_lambda_time_out,
+    double *stage1_lambda_unit_out,
+    double *stage1_lambda_nn_out
 );
 
 /**
@@ -359,6 +407,10 @@ extern int stata_estimate_joint(
  * @param tol                Convergence tolerance
  * @param seed               Random seed
  * @param alpha              Significance level (e.g. 0.05 for 95% CI)
+ * @param ddof               Variance denominator selector: 1 = sample
+ *                           variance 1/(B-1) (default); 0 = paper
+ *                           Algorithm 3 population variance 1/B.
+ *                           Any other value collapses to 1.
  * @param estimates_ptr      [out] Bootstrap ATT estimates (n_bootstrap)
  * @param se_out             [out] Bootstrap standard error
  * @param ci_lower_out       [out] Lower percentile bound (nullable)
@@ -381,6 +433,7 @@ extern int stata_bootstrap_trop_variance(
     double tol,
     uint64_t seed,
     double alpha,
+    int ddof,
     double *estimates_ptr,
     double *se_out,
     double *ci_lower_out,
@@ -410,6 +463,7 @@ extern int stata_bootstrap_trop_variance_joint(
     double tol,
     uint64_t seed,
     double alpha,
+    int ddof,
     double *estimates_ptr,
     double *se_out,
     double *ci_lower_out,
@@ -436,6 +490,131 @@ extern int stata_compute_unit_distance_matrix(
     int n_periods,
     int n_units,
     double *dist_ptr
+);
+
+/**
+ * Twostep estimation with per-unit probability weights.
+ *
+ * Identical to stata_estimate_twostep() but aggregates the per-cell tau
+ * into the ATT as tau_hat = sum_i w_i * tau_{t,i} / sum_i w_i, where w_i
+ * is the pweight attached to the original unit index.  Per-cell estimation
+ * (alpha, beta, L) is unchanged.
+ *
+ * @param unit_weights_ptr  Per-unit pweights (N values); must be non-null
+ *                          and strictly positive (validated by caller).
+ */
+extern int stata_estimate_twostep_weighted(
+    const double *y_ptr,
+    const double *d_ptr,
+    const unsigned char *control_mask_ptr,
+    const int64_t *time_dist_ptr,
+    int n_periods,
+    int n_units,
+    double lambda_time,
+    double lambda_unit,
+    double lambda_nn,
+    int max_iter,
+    double tol,
+    double *att_out,
+    double *tau_ptr,
+    double *alpha_ptr,
+    double *beta_ptr,
+    double *l_ptr,
+    int *n_treated_out,
+    int *n_iterations_out,
+    int *converged_out,
+    int *converged_by_obs_ptr,
+    int *n_iters_by_obs_ptr,
+    const double *unit_weights_ptr
+);
+
+/**
+ * Joint estimation with per-unit probability weights.
+ *
+ * Identical to stata_estimate_joint() but computes the post-hoc ATT as
+ * tau_hat = sum_i w_i * (Y - mu - alpha - beta - L) / sum_i w_i.
+ * The joint estimation of (mu, alpha, beta, L) is unchanged.
+ */
+extern int stata_estimate_joint_weighted(
+    const double *y_ptr,
+    const double *d_ptr,
+    int n_periods,
+    int n_units,
+    double lambda_time,
+    double lambda_unit,
+    double lambda_nn,
+    int max_iter,
+    double tol,
+    double *tau_out,
+    double *mu_out,
+    double *alpha_ptr,
+    double *beta_ptr,
+    double *l_ptr,
+    int *n_iterations_out,
+    int *converged_out,
+    double *tau_vec_ptr,
+    int *n_treated_out,
+    const double *unit_weights_ptr
+);
+
+/**
+ * Twostep bootstrap with per-unit probability weights.
+ *
+ * Same resampling scheme as stata_bootstrap_trop_variance() but aggregates
+ * each replicate's ATT using the pweight inherited from each resampled
+ * unit's original panel column.
+ */
+extern int stata_bootstrap_trop_variance_weighted(
+    const double *y_ptr,
+    const double *d_ptr,
+    const unsigned char *control_mask_ptr,
+    const int64_t *time_dist_ptr,
+    int n_periods,
+    int n_units,
+    double lambda_time,
+    double lambda_unit,
+    double lambda_nn,
+    int n_bootstrap,
+    int max_iter,
+    double tol,
+    uint64_t seed,
+    double alpha,
+    int ddof,
+    double *estimates_ptr,
+    double *se_out,
+    double *ci_lower_out,
+    double *ci_upper_out,
+    int *n_valid_out,
+    const double *unit_weights_ptr
+);
+
+/**
+ * Joint bootstrap with per-unit probability weights.
+ *
+ * Same resampling scheme as stata_bootstrap_trop_variance_joint() but
+ * aggregates each replicate's post-hoc ATT using the pweight inherited
+ * from each resampled unit's original panel column.
+ */
+extern int stata_bootstrap_trop_variance_joint_weighted(
+    const double *y_ptr,
+    const double *d_ptr,
+    int n_periods,
+    int n_units,
+    double lambda_time,
+    double lambda_unit,
+    double lambda_nn,
+    int n_bootstrap,
+    int max_iter,
+    double tol,
+    uint64_t seed,
+    double alpha,
+    int ddof,
+    double *estimates_ptr,
+    double *se_out,
+    double *ci_lower_out,
+    double *ci_upper_out,
+    int *n_valid_out,
+    const double *unit_weights_ptr
 );
 
 /**

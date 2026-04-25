@@ -23,6 +23,7 @@
   Contents
     trop_store_results()                main e() storage entry point
     _trop_safe_read_scalar()            safe scalar reader
+    _trop_lambda_nn_user_face()         1e10 (internal +inf sentinel) -> .
     _trop_display_warnings()            estimation diagnostic messages
     _trop_compute_effective_rank()      SVD-based effective rank
     _trop_display_bootstrap_warnings()  bootstrap diagnostic messages
@@ -59,6 +60,7 @@ void trop_store_results(string scalar method)
 {
     real scalar att, se, ci_lower, ci_upper, pvalue
     real scalar lambda_time, lambda_unit, lambda_nn
+    real scalar stage1_lambda_time, stage1_lambda_unit, stage1_lambda_nn
     real scalar n_iterations, converged, bootstrap_reps, alpha_level
     real scalar n_units, n_periods, n_treated, effective_rank
     real scalar loocv_first_failed_t, loocv_first_failed_i
@@ -69,6 +71,9 @@ void trop_store_results(string scalar method)
     real scalar tstat
     real scalar n_treated_obs, n_treated_units, df_pvalue
     real scalar ci_lower_pct, ci_upper_pct
+    real scalar ci_lower_t, ci_upper_t, pvalue_t
+    real scalar ci_lower_normal, ci_upper_normal, pvalue_normal
+    string scalar cimethod_req, cimethod_used
     real scalar n_obs_estimated, n_obs_failed
     real matrix temp_mat, temp_scalar
 
@@ -95,7 +100,9 @@ void trop_store_results(string scalar method)
         alpha_level = 0.05
     }
 
-    /* Number of treated observations (needed for degrees of freedom).
+    /* Number of treated observations (treated cells W_{it}=1).  Kept for
+       display as e(N_treated_obs); NOT used as the reference df.
+
        Twostep: length of the tau vector (one per treated cell).
        Joint:   count of W_{it}=1 cells in the panel. */
     n_treated_obs = _trop_safe_read_scalar("__trop_n_treated")
@@ -109,28 +116,90 @@ void trop_store_results(string scalar method)
         }
     }
 
-    /* CI and p-value use the same reference distribution:
-         - t-distribution with df = max(1, n_treated - 1) when df is known
-         - standard normal as asymptotic fallback */
+    /* Number of ever-treated units N_1.  Algorithm 3 resamples units
+       with replacement inside the treated stratum, so the bootstrap SE's
+       effective df is governed by the cluster count (units), not by the
+       number of treated cells. */
+    n_treated_units = _trop_safe_read_scalar("__trop_n_treated_units")
+
+    /* Percentile CI from the bootstrap empirical CDF (paper Algorithm 3
+       step 6).  Read before the parametric branch so the caller-selected
+       cimethod() can promote it to the primary CI below. */
+    ci_lower_pct = _trop_safe_read_scalar("__trop_ci_lower_percentile")
+    ci_upper_pct = _trop_safe_read_scalar("__trop_ci_upper_percentile")
+
+    /* Compute all three candidate CI pairs (t, normal, percentile) so
+       consumers can switch interval types without rerunning the model.
+       One of them will be promoted to the authoritative
+       e(ci_lower)/e(ci_upper) pair below, based on __trop_cimethod. */
+    ci_lower_t = .
+    ci_upper_t = .
+    pvalue_t = .
+    ci_lower_normal = .
+    ci_upper_normal = .
+    pvalue_normal = .
+
     if (se > 0 && se < .) {
         tstat = att / se
-        if (n_treated_obs < . && n_treated_obs >= 1) {
-            df_pvalue = max((1, n_treated_obs - 1))
-            pvalue = 2 * ttail(df_pvalue, abs(tstat))
-            ci_lower = att - invttail(df_pvalue, alpha_level / 2) * se
-            ci_upper = att + invttail(df_pvalue, alpha_level / 2) * se
+        /* Standard-normal wrap (always defined when SE > 0). */
+        pvalue_normal = 2 * normal(-abs(tstat))
+        ci_lower_normal = att - invnormal(1 - alpha_level / 2) * se
+        ci_upper_normal = att + invnormal(1 - alpha_level / 2) * se
+
+        /* t(N_1 - 1) wrap whenever at least 2 treated units are available;
+           otherwise the t branch collapses to the normal branch. */
+        if (n_treated_units < . && n_treated_units >= 2) {
+            df_pvalue = max((1, n_treated_units - 1))
+            pvalue_t = 2 * ttail(df_pvalue, abs(tstat))
+            ci_lower_t = att - invttail(df_pvalue, alpha_level / 2) * se
+            ci_upper_t = att + invttail(df_pvalue, alpha_level / 2) * se
         }
         else {
-            pvalue = 2 * normal(-abs(tstat))
-            ci_lower = att - invnormal(1 - alpha_level / 2) * se
-            ci_upper = att + invnormal(1 - alpha_level / 2) * se
+            df_pvalue = .
+            pvalue_t = pvalue_normal
+            ci_lower_t = ci_lower_normal
+            ci_upper_t = ci_upper_normal
         }
     }
     else {
         tstat = .
-        pvalue = .
-        ci_lower = .
-        ci_upper = .
+        df_pvalue = .
+    }
+
+    /* Resolve which CI method is authoritative.  The ADO layer normally
+       sets __trop_cimethod; when absent we default to "percentile"
+       whenever a valid percentile CI exists and to "t" otherwise.  When
+       the user requested "percentile" but the bootstrap produced no
+       finite quantiles we downgrade to "t" and report the downgrade
+       through e(cimethod). */
+    cimethod_req = st_global("__trop_cimethod")
+    if (cimethod_req == "") {
+        if (ci_lower_pct < . && ci_upper_pct < .) cimethod_req = "percentile"
+        else cimethod_req = "t"
+    }
+    cimethod_used = cimethod_req
+    if (cimethod_req == "percentile" && (ci_lower_pct >= . || ci_upper_pct >= .)) {
+        cimethod_used = "t"
+    }
+
+    if (cimethod_used == "percentile") {
+        ci_lower = ci_lower_pct
+        ci_upper = ci_upper_pct
+        /* Percentile CI does not yield a p-value directly; report the
+           t-based p-value so e(pvalue) remains defined.  Consumers that
+           want a percentile-consistent test should invert e(ci_lower/
+           ci_upper) manually. */
+        pvalue = pvalue_t
+    }
+    else if (cimethod_used == "normal") {
+        ci_lower = ci_lower_normal
+        ci_upper = ci_upper_normal
+        pvalue = pvalue_normal
+    }
+    else {  /* "t" or any unforeseen token */
+        ci_lower = ci_lower_t
+        ci_upper = ci_upper_t
+        pvalue = pvalue_t
     }
 
     /* ── regularization hyperparameters ──────────────────────────────── */
@@ -144,6 +213,15 @@ void trop_store_results(string scalar method)
     loocv_n_attempted = _trop_safe_read_scalar("__trop_loocv_n_attempted")
     loocv_first_failed_t = _trop_safe_read_scalar("__trop_loocv_first_failed_t")
     loocv_first_failed_i = _trop_safe_read_scalar("__trop_loocv_first_failed_i")
+
+    /* ── Stage-1 univariate initial lambda triple (paper Footnote 2) ──
+       Written by the cycling LOOCV paths only.  Exhaustive search does
+       not use a Stage-1 initialisation and leaves these scalars unset,
+       in which case `_trop_safe_read_scalar` returns missing (.), which
+       is the correct e() value semantically ("not applicable"). */
+    stage1_lambda_time = _trop_safe_read_scalar("__trop_stage1_lambda_time")
+    stage1_lambda_unit = _trop_safe_read_scalar("__trop_stage1_lambda_unit")
+    stage1_lambda_nn   = _trop_safe_read_scalar("__trop_stage1_lambda_nn")
 
     /* ── convergence information ─────────────────────────────────────── */
     n_iterations = _trop_safe_read_scalar("__trop_n_iterations")
@@ -163,12 +241,9 @@ void trop_store_results(string scalar method)
         level = level * 100
     }
 
-    /* Percentile CI from the bootstrap distribution (diagnostic only).
-       The authoritative CI uses the t-distribution (or normal fallback).
-       Large discrepancy between percentile and parametric CI may indicate
-       asymmetry in the bootstrap distribution. */
-    ci_lower_pct = _trop_safe_read_scalar("__trop_ci_lower_percentile")
-    ci_upper_pct = _trop_safe_read_scalar("__trop_ci_upper_percentile")
+    /* Percentile CI was already read above (for cimethod resolution).
+       Emit the companion scalars into e() below alongside the other
+       candidate intervals. */
 
     /* ── sample information ──────────────────────────────────────────── */
     n_units = _trop_safe_read_scalar("__trop_n_units")
@@ -213,17 +288,39 @@ void trop_store_results(string scalar method)
     st_numscalar("e(ci_lower)", ci_lower)
     st_numscalar("e(ci_upper)", ci_upper)
     st_numscalar("e(pvalue)", pvalue)
-    if (n_treated_obs < . && n_treated_obs >= 1) {
-        st_numscalar("e(df_r)", max((1, n_treated_obs - 1)))
+    /* e(df_r) reflects the reference distribution actually used above:
+       t(N_1 - 1) when N_1 >= 2, missing (normal fallback) otherwise. */
+    if (n_treated_units < . && n_treated_units >= 2) {
+        st_numscalar("e(df_r)", max((1, n_treated_units - 1)))
     }
     else {
         st_numscalar("e(df_r)", .)
     }
 
     /* ── regularization hyperparameters ──────────────────────────────── */
+    /* Round-trip the lambda_nn sentinel back to Stata missing (.) when the
+       estimator ran in the DID/TWFE corner (internal value 1e10) so the
+       exported e(lambda_nn) matches what the user typed / the grid
+       displayed.  Without this the C-bridge-converted 1e10 would leak into
+       user code, breaking symbolic comparisons like `if e(lambda_nn) >= .`. */
     st_numscalar("e(lambda_time)", lambda_time)
     st_numscalar("e(lambda_unit)", lambda_unit)
-    st_numscalar("e(lambda_nn)", lambda_nn)
+    st_numscalar("e(lambda_nn)", _trop_lambda_nn_user_face(lambda_nn))
+
+    /* ── Stage-1 univariate initial lambda triple (paper Footnote 2) ──
+       Cycling LOOCV paths perform three univariate sweeps to seed the
+       Stage-2 coordinate descent; exposing this triple lets downstream
+       diagnostics compare the initial and refined optima.  A large
+       (lambda_stage1, lambda_final) gap indicates Stage-2 did non-
+       trivial work on a non-convex Q(lambda) surface.  The exhaustive
+       LOOCV paths do not use a Stage-1 initialisation and leave these
+       scalars missing. */
+    st_numscalar("e(stage1_lambda_time)", stage1_lambda_time)
+    st_numscalar("e(stage1_lambda_unit)", stage1_lambda_unit)
+    st_numscalar(
+        "e(stage1_lambda_nn)",
+        _trop_lambda_nn_user_face(stage1_lambda_nn)
+    )
 
     /* ── LOOCV diagnostics (first-failure indices) ───────────────────── */
     st_numscalar("e(loocv_first_failed_t)", loocv_first_failed_t)
@@ -242,9 +339,49 @@ void trop_store_results(string scalar method)
     /* ── bootstrap diagnostics ───────────────────────────────────────── */
     st_numscalar("e(n_bootstrap_valid)", n_bootstrap_valid)
     st_numscalar("e(level)", level)
+
+    /* Bootstrap failure rate in [0, 1].  Mirrors e(loocv_fail_rate) so
+       downstream consumers can compare failure severity across the
+       LOOCV and bootstrap stages using a single scalar.  Missing when
+       bootstrap_reps is zero or n_bootstrap_valid was not populated. */
+    if (bootstrap_reps < . & bootstrap_reps > 0 & n_bootstrap_valid < .) {
+        st_numscalar(
+            "e(bootstrap_fail_rate)",
+            (bootstrap_reps - n_bootstrap_valid) / bootstrap_reps
+        )
+    }
+    else {
+        st_numscalar("e(bootstrap_fail_rate)", .)
+    }
+
+    /* All three candidate interval pairs are always written when defined,
+       so downstream consumers can switch cimethod without re-running the
+       model.  e(ci_lower)/e(ci_upper) above holds the one selected via
+       cimethod(); e(cimethod) below records that choice. */
+    if (ci_lower_t < . & ci_upper_t < .) {
+        st_numscalar("e(ci_lower_t)", ci_lower_t)
+        st_numscalar("e(ci_upper_t)", ci_upper_t)
+        st_numscalar("e(pvalue_t)", pvalue_t)
+    }
+    if (ci_lower_normal < . & ci_upper_normal < .) {
+        st_numscalar("e(ci_lower_normal)", ci_lower_normal)
+        st_numscalar("e(ci_upper_normal)", ci_upper_normal)
+        st_numscalar("e(pvalue_normal)", pvalue_normal)
+    }
     if (ci_lower_pct < . & ci_upper_pct < .) {
         st_numscalar("e(ci_lower_percentile)", ci_lower_pct)
         st_numscalar("e(ci_upper_percentile)", ci_upper_pct)
+    }
+
+    /* Record which CI method actually populated e(ci_lower)/e(ci_upper).
+       When cimethod(percentile) was requested but the bootstrap produced
+       no finite quantiles, we downgrade to "t" and surface the downgrade
+       as "percentile->t" so downstream code can detect the auto-repair. */
+    if (cimethod_used != cimethod_req) {
+        st_global("e(cimethod)", cimethod_req + "->" + cimethod_used)
+    }
+    else {
+        st_global("e(cimethod)", cimethod_used)
     }
 
     /* ── parameter matrices ──────────────────────────────────────────── */
@@ -267,7 +404,8 @@ void trop_store_results(string scalar method)
     _trop_store_lambda_grids(lambda_time, lambda_unit, lambda_nn, loocv_score)
 
     /* ── method-specific storage ─────────────────────────────────────── */
-    n_treated_units = _trop_safe_read_scalar("__trop_n_treated_units")
+    /* n_treated_units was already read above for the df reference
+       distribution; only expose it on e() here. */
     if (n_treated_units < .) {
         st_numscalar("e(N_treated_units)", n_treated_units)
     }
@@ -340,8 +478,7 @@ void trop_store_results(string scalar method)
        e(tau) is a vector of length N_treated (time-major).  Build a
        T x N matrix with tau_{it} in its (t, i) cell and missing values
        elsewhere, so that consumers can locate effects by (time, panel)
-       without reconstructing the ordering.  This is the Stata analogue
-       of Python's `TROPResults.treatment_effects` dict. */
+       without reconstructing the ordering. */
     _trop_build_tau_matrix(n_periods, n_units)
 
     /* ── diagnostic warnings ─────────────────────────────────────────── */
@@ -355,6 +492,21 @@ void trop_store_results(string scalar method)
     /* ── command metadata ────────────────────────────────────────────── */
     st_global("e(title)", "TROP Estimator")
     st_global("e(predict)", "trop_p")
+
+    /* ── semantics of nuisance parameters (alpha/beta/factor_matrix) ─
+       Under method(twostep), each treated cell (i,t) has its own
+       (alpha^{i,t}, beta^{i,t}, L^{i,t}); for display we average across
+       treated observations before storing into e(alpha)/e(beta)/
+       e(factor_matrix).  Under method(joint), a single global model
+       produces one (alpha, beta, L, mu) triple.  Downstream consumers
+       can read this tag (e.g. `predict`, user scripts) to branch on
+       the intended interpretation. */
+    if (method == "twostep") {
+        st_global("e(alpha_semantics)", "obs_average")
+    }
+    else {
+        st_global("e(alpha_semantics)", "single_model")
+    }
 }
 
 /*──────────────────────────────────────────────────────────────────────────────
@@ -378,6 +530,42 @@ real scalar _trop_safe_read_scalar(string scalar name)
         return(.)
     }
     return(temp)
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  _trop_lambda_nn_user_face()
+
+  Map the internal large-finite sentinel for lambda_nn = +infinity back to
+  Stata missing (.) for user-facing output.
+
+  Pipeline symmetry
+    User input:    lambda_nn = .   (Stata missing, interpreted as +inf)
+    Grid layer:    stored as .     (trop_numlist_to_grid preserves missing)
+    C bridge:      . -> 1e10       (convert_lambda_infinity in stata_bridge.c)
+    Rust layer:    1e10 triggers the no-low-rank / DID branch (estimation.rs)
+    Plugin return: writes the *converted* value 1e10 back to __trop_lambda_nn
+    Display:       this helper maps 1e10 back to . so the user sees the same
+                   sentinel they typed in.
+
+  The threshold used here (_TROP_LAMBDA_NN_INF_VALUE()) must stay in sync
+  with the threshold used in convert_lambda_infinity() on the C side and
+  the "ln_eff >= 1e10" branch in loocv.rs / estimation.rs on the Rust
+  side; a mismatch would silently display a small finite lambda_nn even
+  though the estimator ran in the DID/TWFE corner.
+──────────────────────────────────────────────────────────────────────────────*/
+
+real scalar _trop_lambda_nn_user_face(real scalar v)
+{
+    if (v >= .) {
+        /* Already Stata missing, e.g. when LOOCV did not produce a value.
+           Round-trip faithfully (missing in -> missing out). */
+        return(.)
+    }
+    if (v >= _TROP_LAMBDA_NN_INF_VALUE()) {
+        /* Post-C-bridge sentinel for +inf; user typed "." so show ".". */
+        return(.)
+    }
+    return(v)
 }
 
 /*──────────────────────────────────────────────────────────────────────────────
@@ -548,7 +736,11 @@ real scalar _trop_compute_effective_rank(real matrix L)
 
   Emits warnings or errors based on the bootstrap failure rate:
     > 50%   error message and deferred fatal exit flag
-    > 10%   warning that standard errors may be less reliable
+    >  5%   warning that standard errors may be less reliable
+
+  The 5% warning threshold is tight enough that high-failure runs
+  (e.g. 11 of 200 replicates) surface instead of passing silently.
+  The 50% abort threshold is retained as a stronger user protection.
 
   Arguments
     n_valid   number of successful bootstrap replications
@@ -560,22 +752,50 @@ void _trop_display_bootstrap_warnings(
     real scalar n_total
 )
 {
-    real scalar failure_rate
+    real scalar failure_rate, lt, lu, ln
+    real matrix temp
+    string scalar ln_str
 
     if (n_total <= 0) return
 
     failure_rate = (n_total - n_valid) / n_total
 
+    /* Selected lambda triple, rendered identically to the LOOCV failure
+       message (paper Algorithm 3 steps 1--6 are evaluated at the winning
+       lambda, so the user should see which triple the Standard-Error
+       distribution was built around when failures surface).  +Inf is
+       user-face represented as Stata missing; render as "+Inf". */
+    lt = .
+    lu = .
+    ln = .
+    temp = st_numscalar("e(lambda_time)")
+    if (rows(temp) > 0) lt = temp
+    temp = st_numscalar("e(lambda_unit)")
+    if (rows(temp) > 0) lu = temp
+    temp = st_numscalar("e(lambda_nn)")
+    if (rows(temp) > 0) ln = temp
+    ln_str = (ln >= . ? "+Inf" : strofreal(ln, "%10.4g"))
+
     if (failure_rate > 0.50) {
-        errprintf("Error: Bootstrap failure rate exceeds 50%% (%.1f%%)\n", failure_rate * 100)
+        errprintf("Error: Bootstrap failure rate exceeds 50%% (%5.1f%%)\n", failure_rate * 100)
         errprintf("       %g of %g bootstrap iterations failed.\n",
                   n_total - n_valid, n_total)
+        if (lt < . & lu < .) {
+            errprintf(
+                "       Selected lambda: (time=%10.4g, unit=%10.4g, nn=%s).\n",
+                lt, lu, ln_str)
+        }
         errprintf("       Check data quality or reduce bootstrap replications.\n")
         st_numscalar("__trop_fatal_rc", 504)
     }
-    else if (failure_rate > 0.10) {
-        printf("{res}Warning: Bootstrap failure rate is %.1f%% (%g/%g successful){txt}\n",
+    else if (failure_rate > 0.05) {
+        printf("{res}Warning: Bootstrap failure rate is %5.1f%% (%g/%g successful){txt}\n",
                failure_rate * 100, n_valid, n_total)
+        if (lt < . & lu < .) {
+            printf(
+                "{txt}         Selected lambda: (time={res}%10.4g{txt}, unit={res}%10.4g{txt}, nn={res}%s{txt}).\n",
+                lt, lu, ln_str)
+        }
         printf("{res}         Standard errors may be less reliable.{txt}\n")
     }
 }
@@ -643,13 +863,30 @@ void _trop_store_lambda_grids(
         }
     }
 
-    /* Locate the grid row closest to the optimal lambdas */
+    /* Locate the grid row closest to the optimal lambdas.
+
+       lambda_grid[, 3] is stored verbatim from __trop_lambda_nn_grid, which
+       preserves Stata missing (.) for the DID/TWFE corner (lambda_nn =
+       +inf).  opt_nn, on the other hand, has already been round-tripped
+       through the C bridge, so a winning +inf entry arrives here as 1e10.
+
+       A naive `(grid_nn - opt_nn)^2` would evaluate to missing whenever
+       grid_nn == . (Stata arithmetic with missing propagates missing),
+       which in turn is never `< best_dist` and the +inf row can therefore
+       never pin as best_row.  We sidestep this by lifting both sides to
+       the common internal-space representation (. -> 1e10) before the
+       squared distance, so the +inf row can match opt_nn == 1e10 with
+       distance zero. */
+    real scalar opt_nn_internal, grid_nn_internal, diff_nn
+    opt_nn_internal = (opt_nn >= . ? _TROP_LAMBDA_NN_INF_VALUE() : opt_nn)
     best_dist = 1e100
     best_row = 1
     for (idx = 1; idx <= n_combo; idx++) {
+        grid_nn_internal = (lambda_grid[idx, 3] >= . ? _TROP_LAMBDA_NN_INF_VALUE() : lambda_grid[idx, 3])
+        diff_nn = grid_nn_internal - opt_nn_internal
         dist = (lambda_grid[idx, 1] - opt_time)^2 +
                (lambda_grid[idx, 2] - opt_unit)^2 +
-               (lambda_grid[idx, 3] - opt_nn)^2
+               diff_nn * diff_nn
         if (dist < best_dist) {
             best_dist = dist
             best_row = idx

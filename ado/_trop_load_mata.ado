@@ -130,7 +130,7 @@ program _trop_load_mata
                 trop_backend_select trop_ereturn_store ///
                 trop_validation ///
                 trop_loocv_validation trop_bootstrap_diagnostics ///
-                trop_estat_helpers trop_estimator_core ///
+                trop_estat_helpers ///
                 trop_main {
                 capture qui findfile `mf'.mata
                 if !_rc {

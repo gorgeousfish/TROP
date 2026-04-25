@@ -47,6 +47,13 @@ mata set matastrict on
     max_iter_user      -- iteration limit for the SVD solver (default 100)
     tol_user           -- convergence tolerance (default 1e-6)
     alpha_level_user   -- significance level for CIs (default 0.05)
+    ddof_user          -- bootstrap-variance denominator selector:
+                          1 = sample variance 1/(B-1) (default),
+                          0 = paper Algorithm 3 population variance 1/B.
+                          Any other value collapses to 1.
+    weight_var_user    -- pweight variable name; empty disables pweights.
+                          When set, per-unit pweights must be strictly
+                          positive and constant within unit.
 
   Returns
     0 on success; nonzero Stata return code on failure.
@@ -68,13 +75,16 @@ real scalar trop_main(
     real scalar verbose,
     | real scalar max_iter_user,
     real scalar tol_user,
-    real scalar alpha_level_user
+    real scalar alpha_level_user,
+    real scalar ddof_user,
+    string scalar weight_var_user
 )
 {
     real scalar rc, do_loocv, do_bootstrap
     real scalar n_units, n_periods
     real colvector panel_idx, time_idx
-    real scalar max_iter_eff, tol_eff, alpha_eff
+    real scalar max_iter_eff, tol_eff, alpha_eff, ddof_eff
+    real scalar have_ddof
     
     // Resolve optional parameters to effective values
     if (args() >= 14 & max_iter_user < . & max_iter_user > 0) max_iter_eff = max_iter_user
@@ -83,6 +93,10 @@ real scalar trop_main(
     else tol_eff = 1e-6
     if (args() >= 16 & alpha_level_user < . & alpha_level_user > 0 & alpha_level_user < 1) alpha_eff = alpha_level_user
     else alpha_eff = 0.05
+    // ddof: forwarded only when the caller supplies a finite value.
+    have_ddof = (args() >= 17 & ddof_user < .)
+    if (have_ddof) ddof_eff = (ddof_user == 0) ? 0 : 1
+    else ddof_eff = 1
     
     // Validate estimation method
     if (method != "twostep" & method != "joint") {
@@ -118,6 +132,19 @@ real scalar trop_main(
     
     // Record the touse variable so the plugin reads only in-sample rows
     st_global("__trop_touse_var", touse_var)
+
+    // Optional pweight: validate + write __trop_unit_weights / __trop_use_weights.
+    // Default is 0 (disabled); the plugin only consults the weighted ABI
+    // when __trop_use_weights is present and equals 1.
+    st_numscalar("__trop_use_weights", 0)
+    if (args() >= 18 & weight_var_user != "") {
+        rc = trop_prepare_pweights(weight_var_user, panel_idx_var,
+                                   touse_var, n_units)
+        if (rc != 0) return(rc)
+        if (verbose) {
+            printf("{txt}Survey weights: enabled (pweight = %s)\n", weight_var_user)
+        }
+    }
     
     // Pre-allocate output matrices (ATT, SE, tau vector, etc.)
     trop_prepare_output_matrices(n_units, n_periods, n_treated)
@@ -149,6 +176,12 @@ real scalar trop_main(
             lambda_nn_grid = st_matrix("__trop_lambda_nn_grid")
         }
         else {
+            // Mirror the default grid advertised by `_trop_set_grid.ado` and
+            // `trop_get_lambda_grid`: a five-point log-decade ladder covering
+            // the empirically relevant range of the paper's Eq. 2 nuclear-
+            // norm penalty.  The DID/TWFE corner (λ_nn = ∞, encoded as
+            // Stata missing .) is reserved for `grid_style(extended)` or
+            // user-supplied grids.
             lambda_nn_grid = (0, 0.01, 0.1, 1, 10)
         }
         
@@ -190,7 +223,8 @@ real scalar trop_main(
         printf("{txt}\nCalling plugin...\n")
     }
     
-    rc = _trop_main(method, do_loocv, do_bootstrap, boot_reps)
+    if (have_ddof) rc = _trop_main(method, do_loocv, do_bootstrap, boot_reps, ddof_eff)
+    else           rc = _trop_main(method, do_loocv, do_bootstrap, boot_reps)
     
     if (rc != 0) {
         errprintf("TROP estimation failed with error code %g\n", rc)
@@ -211,8 +245,9 @@ real scalar trop_main(
   Print a summary table of estimation results.  Reads from temporary Stata
   scalars (__trop_*) populated by the plugin, before ereturn post.
 
-  Inference uses the t(n_treated - 1) distribution when the number of
-  treated cells is available; falls back to the standard normal otherwise.
+  Inference uses the t(N_1 - 1) distribution when at least two treated
+  units are available, falling back to the standard normal otherwise.
+  N_1 is the cluster count for the stratified bootstrap (Algorithm 3).
 ------------------------------------------------------------------------------*/
 
 void _trop_display_summary(string scalar method)
@@ -220,7 +255,7 @@ void _trop_display_summary(string scalar method)
     real scalar att, se, ci_lower, ci_upper, pvalue, tstat
     real scalar lambda_time, lambda_unit, lambda_nn
     real scalar n_units, n_periods, converged
-    real scalar alpha_level, n_treated_obs, df_pvalue
+    real scalar alpha_level, n_treated_units, df_pvalue
     real scalar level_pct
     
     // ATT = (1/sum W) * sum W_{it} * tau_{it}
@@ -238,12 +273,14 @@ void _trop_display_summary(string scalar method)
     level_pct = 100 * (1 - alpha_level)
     
     // Compute t-statistic, p-value, and confidence interval.
-    // df = n_treated - 1 when available; normal approximation otherwise.
-    n_treated_obs = _trop_safe_read_scalar("__trop_n_treated")
+    // Reference distribution: t(N_1 - 1) when at least 2 treated units
+    // are available (Algorithm 3 resamples units, so N_1 is the cluster
+    // count); normal approximation otherwise.
+    n_treated_units = _trop_safe_read_scalar("__trop_n_treated_units")
     if (se > 0 && se < .) {
         tstat = att / se
-        if (n_treated_obs < . && n_treated_obs >= 1) {
-            df_pvalue = max((1, n_treated_obs - 1))
+        if (n_treated_units < . && n_treated_units >= 2) {
+            df_pvalue = max((1, n_treated_units - 1))
             pvalue = 2 * ttail(df_pvalue, abs(tstat))
             ci_lower = att - invttail(df_pvalue, alpha_level / 2) * se
             ci_upper = att + invttail(df_pvalue, alpha_level / 2) * se
@@ -285,7 +322,17 @@ void _trop_display_summary(string scalar method)
     printf("{txt}Selected lambda:\n")
     printf("{txt}  lambda_time:    %12.6f\n", lambda_time)
     printf("{txt}  lambda_unit:    %12.6f\n", lambda_unit)
-    printf("{txt}  lambda_nn:      %12.6f\n", lambda_nn)
+    /* lambda_nn: show the internal 1e10 DID/TWFE corner sentinel as "+inf"
+       so the printed summary matches the user-facing e(lambda_nn) value.
+       _trop_lambda_nn_user_face() returns Stata missing (.) for the corner
+       case; printf's %g formatter renders "." as ".", so we branch here to
+       emit the human-readable "+inf" marker. */
+    if (_trop_lambda_nn_user_face(lambda_nn) >= .) {
+        printf("{txt}  lambda_nn:      %12s  (DID/TWFE corner)\n", "+inf")
+    }
+    else {
+        printf("{txt}  lambda_nn:      %12.6f\n", lambda_nn)
+    }
     printf("{txt}\n")
     printf("{txt}Sample: N=%g units, T=%g periods\n", n_units, n_periods)
     if (converged) printf("{txt}Converged: Yes\n")

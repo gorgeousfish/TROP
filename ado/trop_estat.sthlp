@@ -33,6 +33,7 @@
 {synopt:{opt boot:strap}}bootstrap distribution diagnostics{p_end}
 {synopt:{opt sens:itivity}}hyperparameter sensitivity analysis{p_end}
 {synopt:{opt vce}}variance-covariance matrix{p_end}
+{synopt:{opt triple:rob}}triple-robustness bias decomposition (Theorem 5.1){p_end}
 {synoptline}
 {p2colreset}{...}
 
@@ -44,11 +45,11 @@ Abbreviations are shown by underlining.
 {title:Description}
 
 {pstd}
-{cmd:estat} displays postestimation diagnostics after {helpb trop}.  Seven
+{cmd:estat} displays postestimation diagnostics after {helpb trop}.  Eight
 subcommands are provided for inspecting the estimation sample, weight
 distributions, hyperparameter selection, factor structure, bootstrap
-inference, sensitivity of the LOOCV objective, and the variance-covariance
-matrix.
+inference, sensitivity of the LOOCV objective, the variance-covariance
+matrix, and the Theorem 5.1 triple-robustness bias decomposition.
 
 {pstd}
 All subcommands require that {cmd:trop} has been executed previously.  If no
@@ -88,11 +89,14 @@ Displays weight diagnostics.  Output differs by estimation method:
 {bf:Twostep method:} A note is displayed indicating that weights vary by
 treated observation.  Summary statistics (mean, standard deviation, minimum,
 maximum) are reported for the time weights (theta, T x 1) and unit weights
-(omega, N x 1) associated with the first treated observation.
+(omega, N x 1) associated with the first treated observation.  This is the
+paper's main Algorithm 2 path and permits heterogeneous treatment effects.
 
 {phang}
 {bf:Joint method:} Summary statistics are reported for the global time
-weights (delta_time, T x 1) and unit weights (delta_unit, N x 1).
+weights (delta_time, T x 1) and unit weights (delta_unit, N x 1).  This is
+the shared-weight Remark 6.1 extension, intended for homogeneous effects in
+simultaneous-adoption settings.
 
 {pstd}
 Options:
@@ -110,7 +114,7 @@ the weight vectors.
 {dlgtab:estat loocv}
 
 {p 8 16 2}
-{cmd:estat loocv}
+{cmd:estat loocv} [{cmd:,} {opt stab:ility} {opt tab:le2}]
 
 {pstd}
 Displays LOOCV hyperparameter selection diagnostics, including:
@@ -119,8 +123,35 @@ Displays LOOCV hyperparameter selection diagnostics, including:
 {phang2}- LOOCV objective value Q(lambda_hat){p_end}
 {phang2}- Valid fits count and percentage{p_end}
 {phang2}- Grid style used{p_end}
+{phang2}- Method-specific search mode in effect for the preceding {cmd:trop} call{p_end}
 {phang2}- First failed observation coordinates (if any){p_end}
 {phang2}- Warning if failure rate exceeds 10%{p_end}
+
+{pstd}
+With the {opt stability} option, the following additional diagnostics are
+appended:
+
+{phang2}- LOOCV search strategy in effect ({cmd:cycling} or {cmd:exhaustive}
+for the method used by the preceding {cmd:trop} call){p_end}
+{phang2}- Size and [min, max] range of each lambda grid{p_end}
+{phang2}- Boundary-hit flags when the selected lambda coincides with the
+lowest or highest finite grid point, suggesting the grid should be
+widened.  The {cmd:.} (Stata missing = +infinity) corner of
+{bf:lambda_nn} is recognised as a legitimate DID/TWFE solution and is
+never flagged.{p_end}
+
+{pstd}
+With the {opt table2} option, the command appends a per-dataset coverage
+report for the seven benchmark applications of Table 2 in Athey et al.
+(2025): CPS log-wage, CPS unemployment rate, PWT log-GDP, West Germany,
+Basque, California Smoking, and Mariel Boatlift.  For every benchmark the
+report checks whether the optimal
+(lambda_unit, lambda_time, lambda_nn) triplet reported in the paper is
+present in the lambda grids actually used by the preceding {cmd:trop} call.
+When a value is missing, the report suggests switching to
+{cmd:grid_style(extended)} or adding the missing value to the corresponding
+{opt lambda_*_grid()} option.  This diagnostic requires that the previous
+{cmd:trop} call performed LOOCV (i.e. no {opt fixedlambda()}).
 
 {dlgtab:estat factors}
 
@@ -144,6 +175,12 @@ decomposition (SVD), including:
 {pstd}
 Displays bootstrap distribution diagnostics.  This subcommand requires that
 the {opt bootstrap()} option was specified in the original {cmd:trop} command.
+
+{pstd}
+The reported dispersion summaries are descriptive summaries of the stored
+bootstrap ATT draws.  The variance denominator used for the official
+reported {cmd:e(se)} remains the one selected at estimation time through
+{opt bsvariance(sample|paper)}.
 
 {pstd}
 Output includes:
@@ -196,14 +233,76 @@ data exist and a single regularization parameter varies.
 Displays the variance-covariance matrix of the estimates.  Because the TROP
 estimator produces a scalar ATT, the matrix {cmd:e(V)} is 1 x 1.  The
 standard error, variance estimation method, and bootstrap replication count
-(if applicable) are also reported.
+(if applicable) are also reported.  When bootstrap inference was used, the
+display also reports whether the SE uses the default sample denominator
+{cmd:1/(B-1)} or the paper denominator {cmd:1/B}.
 
 {pstd}
 Options:
 
 {phang}
-{opt correlation} displays the correlation matrix instead of the
-variance-covariance matrix.  For the 1 x 1 case this is trivially 1.
+{opt correlation} is accepted for interface compatibility but has no effect
+on the display because the TROP variance-covariance matrix is scalar (1 x 1).
+
+{dlgtab:estat triplerob}
+
+{p 8 16 2}
+{cmd:estat triplerob} [{cmd:,} {opt rank(#)} {opt topk(#)}]
+
+{pstd}
+Reports a diagnostic decomposition of the paper Theorem 5.1 bias bound
+
+{p 8 8 2}
+|E[tau_hat - tau | L]| <= ||Delta^u(omega, Gamma)||_2 * ||Delta^t(theta, Lambda)||_2 * ||B||_*
+
+{pstd}
+as three factors, computed from {cmd:e(factor_matrix)}, the method-specific
+weight vectors, and the rank-k singular-value decomposition of the estimated
+L matrix.
+
+{pstd}
+{bf:Interpretation.}  Gamma (N x k) and Lambda (T x k) are the unit
+loadings and time factors of the rank-k truncation of L.  The first two
+imbalance terms measure how much the fitted weights fail to reproduce the
+target unit's loading / target period's factor on average over the treated
+cells.  The third term measures the nuclear mass discarded by the rank-k
+truncation.  The product is a diagnostic proxy for the Theorem 5.1 upper
+bound; a small value relative to the bootstrap standard error suggests the
+triple-robustness guarantee is well satisfied.
+
+{pstd}
+For {opt method(joint)} the global weights {cmd:e(delta_time)} and
+{cmd:e(delta_unit)} are used, and the imbalance terms are averaged over all
+treated cells.  For {opt method(twostep)} only {cmd:e(theta)} and
+{cmd:e(omega)} are stored, which describe the weights at the first treated
+cell; the reported decomposition is therefore a conservative proxy for
+that cell.
+
+{pstd}
+Options:
+
+{phang}
+{opt rank(#)} overrides the truncation rank k used for the SVD decomposition
+of L.  Default is {cmd:ceil(e(effective_rank))}, capped at {cmd:min(T, N)}.
+Higher rank retains more singular mass (smaller residual term) but may
+inflate the two imbalance terms if additional components are poorly
+balanced.
+
+{phang}
+{opt topk(#)} controls how many leading singular values are tabulated in
+the header (default {cmd:3}).
+
+{pstd}
+Stored results (in {cmd:r()}):
+
+{synoptset 24 tabbed}{...}
+{synopt:{cmd:r(delta_unit)}}||Delta^u||_2 averaged over treated cells{p_end}
+{synopt:{cmd:r(delta_time)}}||Delta^t||_2 averaged over treated cells{p_end}
+{synopt:{cmd:r(residual)}}nuclear mass discarded by rank-k truncation{p_end}
+{synopt:{cmd:r(bias_bound)}}product of the three factors{p_end}
+{synopt:{cmd:r(rank)}}truncation rank used{p_end}
+{synopt:{cmd:r(method)}}{cmd:twostep} or {cmd:joint}{p_end}
+{synoptline}
 
 
 {marker examples}{...}
@@ -248,15 +347,23 @@ variance-covariance matrix.  For the 1 x 1 case this is trivially 1.
 {pstd}Variance-covariance matrix{p_end}
 {phang2}{cmd:. estat vce}{p_end}
 
+{pstd}Triple-robustness bias decomposition (Theorem 5.1){p_end}
+{phang2}{cmd:. estat triplerob}{p_end}
+
+{pstd}Same with a rank-2 truncation{p_end}
+{phang2}{cmd:. estat triplerob, rank(2)}{p_end}
+
 
 {marker results}{...}
 {title:Stored results}
 
 {pstd}
-The {cmd:estat} subcommands do not store additional results in {cmd:e()}.
+The {cmd:estat} subcommands do not modify the estimation results in {cmd:e()}.
 All displayed statistics are computed from the {cmd:e()} results stored by
-{helpb trop}.  See {helpb trop##results:trop stored results} for the complete
-list of scalars, macros, and matrices available after estimation.
+{helpb trop}.  The exception is {cmd:estat triplerob}, which also stores the
+diagnostic scalars documented above in {cmd:r()}.  See
+{helpb trop##results:trop stored results} for the complete list of scalars,
+macros, and matrices available after estimation.
 
 
 {marker methods}{...}
@@ -308,13 +415,18 @@ a small number of factors.
 {bf:estat bootstrap}
 
 {pstd}
-Bootstrap variance is estimated following Algorithm 3 of Athey et al. (2025).
 The cluster bootstrap resamples N_0 control units and N_1 treated units with
 replacement, re-estimating the TROP estimator for each replicate.  The
-bootstrap variance is:
+reported dispersion summaries are descriptive summaries of the stored
+bootstrap draws.  The official {cmd:e(se)} uses the denominator selected at
+estimation time via {cmd:bsvariance(sample|paper)}; the paper denominator is:
 
 {p 8 8 2}
 V_hat = (1/B) * sum_{b=1}^{B} (tau_hat^(b) - tau_bar)^2
+
+{pstd}
+while the default {cmd:bsvariance(sample)} replaces {cmd:1/B} with
+{cmd:1/(B-1)}.
 
 {pstd}
 Normality of the bootstrap distribution is assessed via the Jarque-Bera
@@ -329,6 +441,41 @@ distribution with 2 degrees of freedom.
 Sensitivity metrics include the coefficient of variation of CV loss across
 grid points, the loss range, and the relative range.  Boundary diagnostics
 check whether the selected optimum lies at the edge of the search grid.
+
+{pstd}
+{bf:estat triplerob}
+
+{pstd}
+Starting from the rank-k SVD L = U * diag(s) * V' where U (T x r),
+V (N x r), and s is the vector of singular values in non-increasing
+order, the paper Theorem 5.1 bias bound is
+
+{p 8 8 2}
+|E[tau_hat - tau | L]| <= ||Delta^u(omega, Gamma)||_2 * ||Delta^t(theta, Lambda)||_2 * ||B||_*
+
+{pstd}
+with
+
+{p 8 8 2}
+Gamma_{i,.} = V[i, 1..k],    Lambda_{t,.} = U[t, 1..k]
+
+{p 8 8 2}
+Delta^u(omega, Gamma) = sum_j omega_j * Gamma_{j,.} - Gamma_{i*,.}
+
+{p 8 8 2}
+Delta^t(theta, Lambda) = sum_s theta_s * Lambda_{s,.} - Lambda_{t*,.}
+
+{p 8 8 2}
+||B||_* ~= sum_{h > k} s_h   (nuclear mass discarded by truncation)
+
+{pstd}
+where (i*, t*) indexes a treated cell.  The ||.||_2 terms are L2 norms
+over the k-component loadings.  For {opt method(joint)} the reported
+||Delta^u||_2 and ||Delta^t||_2 are arithmetic means over all treated
+cells with the global weights {cmd:e(delta_unit)}, {cmd:e(delta_time)}.
+For {opt method(twostep)} only the first-treated-cell weights
+{cmd:e(omega)}, {cmd:e(theta)} are available in {cmd:e()}, and the
+decomposition reports those cell-specific quantities.
 
 
 {marker references}{...}
